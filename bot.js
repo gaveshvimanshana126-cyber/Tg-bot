@@ -14,7 +14,7 @@ const BASE    = 'https://api.chamindu.site/api/v1';
 const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🌸 VIMA SUBTITLES BOT started...');
 
-const BANNER = 'https://ibb.co/ynN2TZSH'; // will use user's image
+const BANNER = 'https://i.imgur.com/placeholder.png'; // will use user's image
 const userState = {};
 
 // ══════════════════════════════════════════
@@ -89,6 +89,11 @@ function cleanTitle(t='') {
 bot.onText(/\/start/, async (msg) => {
   const name = msg.from.first_name || 'යාළුවා';
   const chatId = msg.chat.id;
+
+  // Send VIMA banner
+  try {
+    await bot.sendPhoto(chatId, 'https://i.ibb.co/ynN2TZSH/0000000069f481f4920da79c28607b62.jpg').catch(()=>{});
+  } catch(e){}
 
   await bot.sendMessage(chatId,
 `🌸 *VIMA SUBTITLES BOT* 🌸
