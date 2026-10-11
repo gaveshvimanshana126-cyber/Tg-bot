@@ -14,7 +14,7 @@ const BASE    = 'https://api.chamindu.site/api/v1';
 const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🌸 VIMA SUBTITLES BOT started...');
 
-const BANNER = 'https://i.imgur.com/placeholder.png'; // will use user's image
+const BANNER = 'https://ibb.co/ynN2TZSH'; // will use user's image
 const userState = {};
 
 // ══════════════════════════════════════════
