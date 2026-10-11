@@ -8,35 +8,31 @@ const os = require('os');
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) { console.error('BOT_TOKEN not set!'); process.exit(1); }
 
-const API_KEY = 'chama_api_3d72ec318aaf94313008eff7e38f3fbe';
-const LKSUB_BASE   = 'https://api.chamindu.site/api/v1/movies/lksub';
-const CINE_BASE    = 'https://api.chamindu.site/api/v1/movies/cinevibes';
+const API_KEY  = 'chama_api_3d72ec318aaf94313008eff7e38f3fbe';
+const LKSUB    = 'https://api.chamindu.site/api/v1/movies/lksub';
+const CINEMX   = 'https://api.chamindu.site/api/v1/movies/cinemx';
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 console.log('🤖 Bot started...');
 
 const userState = {};
 
-// ═══════════════════════════════════════
-// DOWNLOAD FILE HELPER
-// ═══════════════════════════════════════
+// ══════════════════════════════════════════════
+// DOWNLOAD FILE (for small files like SRT/ZIP)
+// ══════════════════════════════════════════════
 function downloadFile(url, ext) {
   return new Promise((resolve, reject) => {
-    const tmpPath = path.join(os.tmpdir(), 'dl_' + Date.now() + (ext || '.bin'));
-    const file = fs.createWriteStream(tmpPath);
-
-    function doGet(reqUrl, hops = 0) {
+    const tmp = path.join(os.tmpdir(), 'dl_' + Date.now() + (ext || '.bin'));
+    const file = fs.createWriteStream(tmp);
+    function doGet(u, hops=0) {
       if (hops > 5) return reject(new Error('Too many redirects'));
-      const proto = reqUrl.startsWith('https') ? https : http;
-      proto.get(reqUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.lksubs.com/' }
-      }, (res) => {
-        if ([301,302,307,308].includes(res.statusCode) && res.headers.location) {
-          return doGet(res.headers.location, hops + 1);
-        }
-        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode} — Server rejected the request`));
+      const proto = u.startsWith('https') ? https : http;
+      proto.get(u, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://cinemx.lk/' } }, (res) => {
+        if ([301,302,307,308].includes(res.statusCode) && res.headers.location)
+          return doGet(res.headers.location, hops+1);
+        if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
         res.pipe(file);
-        file.on('finish', () => { file.close(); resolve(tmpPath); });
+        file.on('finish', () => { file.close(); resolve(tmp); });
         file.on('error', reject);
       }).on('error', reject);
     }
@@ -44,51 +40,47 @@ function downloadFile(url, ext) {
   });
 }
 
-// ═══════════════════════════════════════
-// API HELPERS
-// ═══════════════════════════════════════
+// ══════════════════════════════════════════════
+// API
+// ══════════════════════════════════════════════
+async function apiGet(url) {
+  const r = await fetch(url); return r.json();
+}
+
+async function cinemxSearch(q) {
+  const d = await apiGet(`${CINEMX}/search?q=${encodeURIComponent(q)}&api_key=${API_KEY}`);
+  return d.status ? (d.data||[]).map(x=>({...x,_src:'cinemx'})) : [];
+}
+async function cinemxDetail(link) {
+  const d = await apiGet(`${CINEMX}/infodl?q=${encodeURIComponent(link)}&api_key=${API_KEY}`);
+  return d.status ? {...d.data, _src:'cinemx'} : null;
+}
 async function lksubSearch(q) {
-  const r = await fetch(`${LKSUB_BASE}/search?q=${encodeURIComponent(q)}&api_key=${API_KEY}`);
-  const d = await r.json();
-  return d.status ? (d.data || []).map(x => ({ ...x, _src: 'lksub' })) : [];
+  const d = await apiGet(`${LKSUB}/search?q=${encodeURIComponent(q)}&api_key=${API_KEY}`);
+  return d.status ? (d.data||[]).map(x=>({...x,_src:'lksub'})) : [];
 }
 async function lksubDetail(link) {
-  const r = await fetch(`${LKSUB_BASE}/infodl?q=${encodeURIComponent(link)}&api_key=${API_KEY}`);
-  const d = await r.json();
-  return d.status ? d.data : null;
+  const d = await apiGet(`${LKSUB}/infodl?q=${encodeURIComponent(link)}&api_key=${API_KEY}`);
+  return d.status ? {...d.data, _src:'lksub'} : null;
 }
 
-async function cineSearch(q) {
-  const r = await fetch(`${CINE_BASE}/search?q=${encodeURIComponent(q)}&api_key=${API_KEY}`);
-  const d = await r.json();
-  return d.status ? (d.data || []).map(x => ({ ...x, _src: 'cine' })) : [];
-}
-async function cineDetail(link) {
-  const r = await fetch(`${CINE_BASE}/infodl?url=${encodeURIComponent(link)}&api_key=${API_KEY}`);
-  const d = await r.json();
-  return d.status ? d.data : null;
-}
-
-// ═══════════════════════════════════════
-// /start
-// ═══════════════════════════════════════
+// ══════════════════════════════════════════════
+// COMMANDS
+// ══════════════════════════════════════════════
 bot.onText(/\/start/, (msg) => {
   const name = msg.from.first_name || 'යාළුවා';
   bot.sendMessage(msg.chat.id,
 `👋 හෙලෝ *${name}*!
 
-🎬 *Sinhala Subtitles Bot* එකට ඔයොස් වදිල ❤️
+🎬 *Sinhala Subtitles Bot* ❤️
 
 Movie name ලියලා send කරන්න!
 
-*Sources:*
+📦 *Sources:*
+🎞️ CineMX — Movie + Subtitles
 📦 LKSubs — Subtitle ZIPs
-🎞️ CineVibes — Movie + SRT files
 
-*Commands:*
-/start - Bot start
-/help - Help
-/id - Chat ID`,
+/help /id`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -97,13 +89,15 @@ bot.onText(/\/help/, (msg) => {
   bot.sendMessage(msg.chat.id,
 `📋 *Help*
 
-Movie name ලියලා send කරන්න
-Bot එක LKSubs + CineVibes දෙකෙන්ම search කරනවා
+Movie name type කරලා send කරන්න
+Results list ලෙස select කරන්න
 
-📥 Subtitle ZIP / SRT direct download
-🎬 Movie file links
+🎞️ *CineMX:*
+• 4K / 1080p / 720p / 480p download links
+• Sinhala + English subtitle links
 
-*උදා:* Avatar, Badrinath, Oppenheimer`,
+📦 *LKSubs:*
+• Subtitle ZIP direct download`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -115,227 +109,200 @@ bot.onText(/\/id/, (msg) => {
   );
 });
 
-// ═══════════════════════════════════════
-// TEXT → SEARCH (both sources)
-// ═══════════════════════════════════════
+// ══════════════════════════════════════════════
+// SEARCH
+// ══════════════════════════════════════════════
 bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   const chatId = msg.chat.id;
-  const query = msg.text.trim();
+  const query  = msg.text.trim();
 
-  const statusMsg = await bot.sendMessage(chatId, `🔍 *"${query}"* සෙවිල්ලා... ⏳`, { parse_mode: 'Markdown' });
+  const st = await bot.sendMessage(chatId, `🔍 *"${query}"* සෙවිල්ලා... ⏳`, { parse_mode: 'Markdown' });
 
   try {
-    const [lkResults, cineResults] = await Promise.allSettled([
-      lksubSearch(query),
-      cineSearch(query)
-    ]);
-
-    const lk   = lkResults.status === 'fulfilled'   ? lkResults.value   : [];
-    const cine = cineResults.status === 'fulfilled' ? cineResults.value : [];
-    const all  = [...cine, ...lk]; // CineVibes first (has movie files)
+    const [cx, lk] = await Promise.allSettled([cinemxSearch(query), lksubSearch(query)]);
+    const all = [
+      ...(cx.status==='fulfilled' ? cx.value : []),
+      ...(lk.status==='fulfilled' ? lk.value : [])
+    ];
 
     if (!all.length) {
-      await bot.editMessageText(
-        `😔 *"${query}"* සඳහා results හමු නොවුණා.\nවෙනත් title try කරන්න.`,
-        { chat_id: chatId, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
-      );
-      return;
+      return bot.editMessageText(`😔 *"${query}"* — results නෑ.\nවෙනත් title try කරන්න.`,
+        { chat_id: chatId, message_id: st.message_id, parse_mode: 'Markdown' });
     }
 
     userState[chatId] = { results: all };
 
-    const keyboard = all.slice(0, 8).map((r, i) => {
-      const src  = r._src === 'cine' ? '🎞️' : '📦';
-      const name = (r.title || '').replace(/ Sinhala Subtitles.*$/i, '').trim();
+    const kb = all.slice(0,8).map((r,i) => {
+      const icon = r._src==='cinemx' ? '🎞️' : '📦';
+      const name = (r.title||'').replace(/ (With |)\bSinhala\b.*/i,'').replace(/\[.*\]/,'').trim();
       const yr   = r.year ? ` (${r.year})` : '';
-      return [{ text: `${src} ${name}${yr}`, callback_data: `pick_${i}` }];
+      return [{ text:`${icon} ${name}${yr}`, callback_data:`pick_${i}` }];
     });
 
-    await bot.editMessageText(
-      `✅ *${all.length}* result(s) — select a movie:\n\n🎞️ CineVibes  📦 LKSubs`,
-      {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: keyboard }
-      }
+    bot.editMessageText(
+      `✅ *${all.length}* result(s)\n🎞️ CineMX  📦 LKSubs\n\nSelect:`,
+      { chat_id: chatId, message_id: st.message_id, parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: kb } }
     );
-
-  } catch (err) {
-    console.error(err);
-    await bot.editMessageText(`❌ Error: ${err.message}`, { chat_id: chatId, message_id: statusMsg.message_id });
+  } catch(e) {
+    bot.editMessageText(`❌ ${e.message}`, { chat_id: chatId, message_id: st.message_id });
   }
 });
 
-// ═══════════════════════════════════════
-// CALLBACK
-// ═══════════════════════════════════════
+// ══════════════════════════════════════════════
+// CALLBACKS
+// ══════════════════════════════════════════════
 bot.on('callback_query', async (cb) => {
   const chatId = cb.message.chat.id;
   const msgId  = cb.message.message_id;
   const data   = cb.data;
   await bot.answerCallbackQuery(cb.id);
 
-  // ── Movie selected ──
+  // ── Pick movie ──
   if (data.startsWith('pick_')) {
-    const idx = parseInt(data.replace('pick_', ''));
-    const state = userState[chatId];
-    if (!state?.results[idx]) return;
+    const idx  = parseInt(data.replace('pick_',''));
+    const item = userState[chatId]?.results?.[idx];
+    if (!item) return;
 
-    const item = state.results[idx];
-    await bot.editMessageText(`⏳ Loading details...`, { chat_id: chatId, message_id: msgId });
+    await bot.editMessageText(`⏳ Loading...`, { chat_id: chatId, message_id: msgId });
 
     try {
-      let detail;
-      if (item._src === 'cine') {
-        detail = await cineDetail(item.link);
-        if (detail) detail._src = 'cine';
-      } else {
-        detail = await lksubDetail(item.link);
-        if (detail) detail._src = 'lksub';
-      }
-      if (!detail) throw new Error('Details load failed');
+      const detail = item._src==='cinemx'
+        ? await cinemxDetail(item.link)
+        : await lksubDetail(item.link);
+      if (!detail) throw new Error('Details failed');
 
       userState[chatId].detail = detail;
-      userState[chatId].itemLink = item.link;
 
-      const title  = (detail.title || item.title || '').replace(/ Sinhala Subtitles.*$/i, '').trim();
-      const genres = Array.isArray(detail.genres) ? detail.genres.join(', ') : (detail.genres || 'N/A');
-      const imdb   = detail.imdb || 'N/A';
-      const dur    = detail.duration ? `⏱️ *Duration:* ${detail.duration}\n` : '';
-      const qual   = detail.quality  ? `📺 *Quality:* ${detail.quality}\n`   : '';
-      const subBy  = detail.subtitle_by ? `\n✍️ *Subtitle by:* ${detail.subtitle_by}` : '';
+      const title   = (detail.title||'').replace(/ (With |)\bSinhala\b.*/i,'').replace(/\[.*\]/,'').trim();
+      const genres  = Array.isArray(detail.genres) ? detail.genres.join(', ') : (detail.genres||'N/A');
+      const cast    = (detail.cast||[]).slice(0,5).join(', ') || 'N/A';
+      const dur     = detail.duration ? `⏱ *Duration:* ${detail.duration}\n` : '';
+      const qual    = detail.quality  ? `📺 *Quality:* ${detail.quality}\n`  : '';
+      const dir     = detail.director ? `🎬 *Director:* ${detail.director}\n`: '';
+      const lang    = detail.language ? `🗣 *Language:* ${detail.language}\n` : '';
+      const story   = (detail.story||'').slice(0,300);
 
-      // Build download buttons
-      const dlBtns = [];
+      let dlBtns = [];
 
-      if (item._src === 'cine') {
-        // SRT subtitle
-        if (detail.subtitles?.length) {
-          detail.subtitles.forEach((s, i) => {
-            dlBtns.push([{ text: `📄 ${s.language} Subtitle (.srt) — Download`, callback_data: `srt_${i}` }]);
-          });
-        }
-        // Movie downloads
-        if (detail.downloads?.length) {
-          detail.downloads
-            .filter(d => !d.quality?.toLowerCase().includes('subtitle'))
-            .forEach((d, i) => {
-              dlBtns.push([{ text: `🎬 ${d.title} [${d.size}]`, callback_data: `mov_${i}` }]);
-            });
-        }
-        dlBtns.push([{ text: '🌐 CineVibes ලෙස බලන්න', url: item.link }]);
-      } else {
-        // LKSubs ZIPs
-        (detail.downloads || []).forEach((d, i) => {
-          const isZip = d.link?.includes('.zip') || d.name?.toLowerCase().includes('subtitle');
-          dlBtns.push([{
-            text: isZip ? `📥 Subtitle ZIP — Download` : `🎬 ${d.name}`,
-            callback_data: isZip ? `zip_${i}` : `ext_${i}`
-          }]);
+      if (item._src === 'cinemx') {
+        // Group: movies + subtitles
+        const movies = (detail.downloads||[]).filter(d=>!d.quality?.includes('SRT'));
+        const subs   = (detail.downloads||[]).filter(d=> d.quality?.includes('SRT'));
+
+        movies.forEach((d,i) => {
+          dlBtns.push([{ text:`🎬 ${d.name||d.title} ${d.size&&d.size!=='N/A'?'['+d.size+']':''}`.trim(),
+            callback_data:`cxmov_${i}` }]);
         });
-        dlBtns.push([{ text: '🌐 LKSubs ලෙස බලන්න', url: item.link }]);
+        subs.forEach((d,i) => {
+          const isSi = d.name?.toLowerCase().includes('sinhala')||d.title?.toLowerCase().includes('sinhala');
+          dlBtns.push([{ text:`${isSi?'🇱🇰':'🇬🇧'} ${d.name||d.title}`,
+            callback_data:`cxsub_${i}` }]);
+        });
+        dlBtns.push([{ text:'🌐 CineMX ලෙස බලන්න', url: item.link }]);
+      } else {
+        // LKSubs
+        (detail.downloads||[]).forEach((d,i)=>{
+          const isZip = d.link?.includes('.zip');
+          dlBtns.push([{ text: isZip ? `📥 Subtitle ZIP Download` : `🎬 ${d.name}`,
+            callback_data: isZip ? `lkzip_${i}` : `lkext_${i}` }]);
+        });
+        dlBtns.push([{ text:'🌐 LKSubs ලෙස බලන්න', url: item.link }]);
       }
 
       const caption =
 `🎬 *${title}*
+⭐ *IMDb:* ${detail.imdb||'N/A'}  📅 *Year:* ${detail.year||'N/A'}
 🎭 *Genres:* ${genres}
-⭐ *IMDb:* ${imdb}
-${dur}${qual}🗣️ *Subtitles:* Sinhala${subBy}
+${dur}${qual}${dir}${lang}👥 *Cast:* ${cast}
 
-📥 *Download Options:*`;
+📖 ${story}${story.length>=300?'...':''}
 
-      await bot.deleteMessage(chatId, msgId).catch(() => {});
+📥 *Downloads:*`;
+
+      await bot.deleteMessage(chatId, msgId).catch(()=>{});
       const img = detail.image || item.image;
       if (img) {
         await bot.sendPhoto(chatId, img, {
-          caption, parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: dlBtns }
+          caption: caption.slice(0,1024),
+          parse_mode:'Markdown',
+          reply_markup:{ inline_keyboard: dlBtns }
         });
       } else {
         await bot.sendMessage(chatId, caption, {
-          parse_mode: 'Markdown',
-          reply_markup: { inline_keyboard: dlBtns }
+          parse_mode:'Markdown',
+          reply_markup:{ inline_keyboard: dlBtns }
         });
       }
-
-    } catch (err) {
-      console.error(err);
-      await bot.sendMessage(chatId, `❌ Error: ${err.message}\n\n🔗 ${item.link}`);
+    } catch(e) {
+      console.error(e);
+      bot.sendMessage(chatId, `❌ Error: ${e.message}\n🔗 ${item.link}`);
     }
   }
 
-  // ── SRT Download ──
-  if (data.startsWith('srt_')) {
-    const i = parseInt(data.replace('srt_', ''));
-    const detail = userState[chatId]?.detail;
-    if (!detail?.subtitles?.[i]) return;
-    const sub = detail.subtitles[i];
-    await sendFile(chatId, sub.link, '.srt', `📄 *${detail.title} — Sinhala Subtitle (.srt)*`);
-  }
-
-  // ── Movie download (CineVibes) — send link (too large for bot) ──
-  if (data.startsWith('mov_')) {
-    const i = parseInt(data.replace('mov_', ''));
-    const detail = userState[chatId]?.detail;
-    if (!detail?.downloads?.[i]) return;
-    const dl = detail.downloads[i];
-    await bot.sendMessage(chatId,
-      `🎬 *${dl.title}* [${dl.size}]\n\n🔗 [Download Link](${dl.link})`,
-      { parse_mode: 'Markdown', disable_web_page_preview: true }
+  // ── CineMX movie link ──
+  if (data.startsWith('cxmov_')) {
+    const i = parseInt(data.replace('cxmov_',''));
+    const dl = (userState[chatId]?.detail?.downloads||[])
+      .filter(d=>!d.quality?.includes('SRT'))[i];
+    if (!dl) return;
+    bot.sendMessage(chatId,
+      `🎬 *${dl.name||dl.title}*\n${dl.size&&dl.size!=='N/A'?`📦 Size: ${dl.size}\n`:''}\n🔗 [Download Link](${dl.link})\n\n_Browser / IDM ලෙස open කරලා download කරන්න_`,
+      { parse_mode:'Markdown', disable_web_page_preview:true }
     );
   }
 
-  // ── LKSubs ZIP Download ──
-  if (data.startsWith('zip_')) {
-    const i = parseInt(data.replace('zip_', ''));
-    const detail = userState[chatId]?.detail;
-    if (!detail?.downloads?.[i]) return;
-    const dl = detail.downloads[i];
-    await sendFile(chatId, dl.link, '.zip', `📥 *Sinhala Subtitle ZIP*\n${dl.name || ''}`);
+  // ── CineMX subtitle link ──
+  if (data.startsWith('cxsub_')) {
+    const i = parseInt(data.replace('cxsub_',''));
+    const subs = (userState[chatId]?.detail?.downloads||[])
+      .filter(d=>d.quality?.includes('SRT'));
+    const dl = subs[i];
+    if (!dl) return;
+    // Try direct download first, fallback to link
+    await sendFileOrLink(chatId, dl.link, '.srt', `📝 *${dl.name||dl.title}*`);
   }
 
-  // ── External link (LKSubs movie file) ──
-  if (data.startsWith('ext_')) {
-    const i = parseInt(data.replace('ext_', ''));
-    const detail = userState[chatId]?.detail;
-    if (!detail?.downloads?.[i]) return;
-    const dl = detail.downloads[i];
-    await bot.sendMessage(chatId,
+  // ── LKSubs ZIP ──
+  if (data.startsWith('lkzip_')) {
+    const i = parseInt(data.replace('lkzip_',''));
+    const dl = (userState[chatId]?.detail?.downloads||[])[i];
+    if (!dl) return;
+    await sendFileOrLink(chatId, dl.link, '.zip', `📥 *Sinhala Subtitle ZIP*`);
+  }
+
+  // ── LKSubs external ──
+  if (data.startsWith('lkext_')) {
+    const i = parseInt(data.replace('lkext_',''));
+    const dl = (userState[chatId]?.detail?.downloads||[])[i];
+    if (!dl) return;
+    bot.sendMessage(chatId,
       `🎬 *${dl.name}*\n\n🔗 [Download Link](${dl.link})`,
-      { parse_mode: 'Markdown', disable_web_page_preview: true }
+      { parse_mode:'Markdown', disable_web_page_preview:true }
     );
   }
 });
 
-// ═══════════════════════════════════════
-// SEND FILE HELPER
-// ═══════════════════════════════════════
-async function sendFile(chatId, url, ext, caption) {
-  const statusMsg = await bot.sendMessage(chatId, `⏳ Downloading... please wait`);
+// ══════════════════════════════════════════════
+// SEND FILE OR FALLBACK TO LINK
+// ══════════════════════════════════════════════
+async function sendFileOrLink(chatId, url, ext, caption) {
+  const st = await bot.sendMessage(chatId, `⏳ Downloading...`);
   try {
-    const filePath = await downloadFile(url, ext);
-    const sizeMB = (fs.statSync(filePath).size / 1024 / 1024).toFixed(2);
-    await bot.editMessageText(`📦 Sending (${sizeMB} MB)...`, {
-      chat_id: chatId, message_id: statusMsg.message_id
-    });
-    await bot.sendDocument(chatId, filePath, { caption, parse_mode: 'Markdown' });
-    fs.unlinkSync(filePath);
-    await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-  } catch (err) {
-    console.error('File send error:', err.message);
-    // Fallback — send direct link so user can download manually
-    await bot.editMessageText(
-      `⚠️ Bot direct download failed.\n\n📎 *Manual download link:*\n[Click here to download](${url})\n\n_(Browser ලෙස open කරලා download කරන්න)_`,
-      {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true
-      }
+    const fp = await downloadFile(url, ext);
+    const mb = (fs.statSync(fp).size/1024/1024).toFixed(2);
+    await bot.editMessageText(`📦 Sending (${mb} MB)...`, { chat_id:chatId, message_id:st.message_id });
+    await bot.sendDocument(chatId, fp, { caption, parse_mode:'Markdown' });
+    fs.unlinkSync(fp);
+    bot.deleteMessage(chatId, st.message_id).catch(()=>{});
+  } catch(e) {
+    console.error('sendFile error:', e.message);
+    bot.editMessageText(
+      `⚠️ Bot direct download failed.\n\n📎 *Manual download:*\n[Click here](${url})\n\n_Browser ලෙස open කරලා download කරන්න_`,
+      { chat_id:chatId, message_id:st.message_id, parse_mode:'Markdown', disable_web_page_preview:true }
     );
   }
 }
 
-bot.on('polling_error', (err) => console.error('Polling error:', err.message));
+bot.on('polling_error', (e) => console.error('Polling:', e.message));
