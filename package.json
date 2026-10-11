@@ -1,7 +1,7 @@
 {
-  "name": "mcf-telegram-bot",
-  "version": "1.0.0",
-  "description": "MCF Telegram Bot",
+  "name": "vima-subtitles-bot",
+  "version": "2.0.0",
+  "description": "VIMA SUBTITLES BOT - Create by Gavesh Vimanshana",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
