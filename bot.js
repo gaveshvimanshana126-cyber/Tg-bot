@@ -34,7 +34,7 @@ function downloadFile(url, ext) {
         if ([301,302,307,308].includes(res.statusCode) && res.headers.location) {
           return doGet(res.headers.location, hops + 1);
         }
-        if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode));
+        if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode} — Server rejected the request`));
         res.pipe(file);
         file.on('finish', () => { file.close(); resolve(tmpPath); });
         file.on('error', reject);
@@ -325,9 +325,15 @@ async function sendFile(chatId, url, ext, caption) {
     await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
   } catch (err) {
     console.error('File send error:', err.message);
+    // Fallback — send direct link so user can download manually
     await bot.editMessageText(
-      `❌ Download failed.\n\n📎 Manual link:\n${url}`,
-      { chat_id: chatId, message_id: statusMsg.message_id }
+      `⚠️ Bot direct download failed.\n\n📎 *Manual download link:*\n[Click here to download](${url})\n\n_(Browser ලෙස open කරලා download කරන්න)_`,
+      {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true
+      }
     );
   }
 }
