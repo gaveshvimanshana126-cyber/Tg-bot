@@ -16,7 +16,8 @@ if (!BOT_TOKEN) { console.error('❌ BOT_TOKEN not set!'); process.exit(1); }
 // ── Channel resolve ──
 function resolveChannel(ch) {
   if (!ch) return null;
-  if (ch.startsWith('https://t.me/')) return '@' + ch.replace('https://t.me/', '');
+  ch = ch.trim();
+  if (ch.startsWith('https://t.me/')) return '@' + ch.replace('https://t.me/', '').trim();
   return ch;
 }
 const CHANNEL_ID = resolveChannel(CHANNEL);
@@ -32,7 +33,7 @@ function saveSeen(set) {
 
 // ── Firebase ──
 async function fetchMovies() {
-  const url = `${DB_URL}/movies.json?key=${API_KEY}&limitToLast=20`;
+  const url = `${DB_URL}/movies.json?key=${API_KEY}&orderBy="$key"&limitToLast=20`;
   console.log(`[Firebase] Fetching: ${url}`);
   const r = await fetch(url);
   if (!r.ok) throw new Error(`Firebase HTTP ${r.status}`);
