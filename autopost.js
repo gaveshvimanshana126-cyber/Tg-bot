@@ -27,19 +27,29 @@ const CHANNEL_ID = resolveChannel(CHANNEL);
 async function loadSeen() {
   try {
     const r = await fetch(`${DB_URL}/bot_seen.json?key=${API_KEY}`);
-    if (!r.ok) return new Set();
+    console.log(`[Seen] Firebase read status: ${r.status}`);
+    if (!r.ok) { console.error('[Seen] Read failed:', r.status); return new Set(); }
     const data = await r.json();
-    if (!data || !Array.isArray(data)) return new Set();
-    return new Set(data);
-  } catch(e) { return new Set(); }
+    console.log(`[Seen] Raw data type: ${typeof data}, isArray: ${Array.isArray(data)}`);
+    if (!data) return new Set();
+    if (Array.isArray(data)) return new Set(data);
+    if (typeof data === 'object') return new Set(Object.values(data));
+    return new Set();
+  } catch(e) {
+    console.error('[Seen] Load error:', e.message);
+    return new Set();
+  }
 }
 async function saveSeen(set) {
   try {
-    await fetch(`${DB_URL}/bot_seen.json?key=${API_KEY}`, {
+    const arr = [...set];
+    const r = await fetch(`${DB_URL}/bot_seen.json?key=${API_KEY}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify([...set])
+      body: JSON.stringify(arr)
     });
+    if (!r.ok) console.error('[Seen] Save failed:', r.status);
+    else console.log(`[Seen] Saved ${arr.length} IDs to Firebase`);
   } catch(e) { console.error('[Seen] Save error:', e.message); }
 }
 
@@ -149,7 +159,7 @@ async function check() {
       // Mark all existing as seen on startup
       let count = 0;
       movies.forEach(m => { if (!seen.has(m.id)) { seen.add(m.id); count++; } });
-      await await saveSeen(seen);
+      await saveSeen(seen);
       isFirst = false;
       console.log(`✅ Startup done. Marked ${count} movies as seen. Watching for new ones...`);
 
