@@ -8,7 +8,8 @@ const BOT_TOKEN   = process.env.BOT_TOKEN;
 const CHANNEL     = process.env.TG_CHANNEL || 'https://t.me/Hitestpost';
 const DB_URL      = process.env.FIREBASE_DB_URL || 'https://cineflix1-1fdc6-default-rtdb.firebaseio.com';
 const API_KEY     = process.env.FIREBASE_API_KEY || 'AIzaSyAh6zMB65iWqt3R2Ep0C5_7eV8ZaUHI7t8';
-const SEEN_FILE   = '/tmp/vima_seen.json';
+const SEEN_DIR  = require('fs').existsSync('/data') ? '/data' : '/tmp';
+const SEEN_FILE = SEEN_DIR + '/vima_seen.json';
 const CHECK_EVERY = 2 * 60 * 1000; // 2 minutes
 
 if (!BOT_TOKEN) { console.error('❌ BOT_TOKEN not set!'); process.exit(1); }
