@@ -23,13 +23,24 @@ function resolveChannel(ch) {
 }
 const CHANNEL_ID = resolveChannel(CHANNEL);
 
-// ── Seen ──
-function loadSeen() {
-  try { return new Set(JSON.parse(fs.readFileSync(SEEN_FILE,'utf8'))); }
-  catch(e) { return new Set(); }
+// ── Seen — Firebase ලෙස save (restart ලෙස persist වෙනවා) ──
+async function loadSeen() {
+  try {
+    const r = await fetch(`${DB_URL}/bot_seen.json?key=${API_KEY}`);
+    if (!r.ok) return new Set();
+    const data = await r.json();
+    if (!data || !Array.isArray(data)) return new Set();
+    return new Set(data);
+  } catch(e) { return new Set(); }
 }
-function saveSeen(set) {
-  try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...set])); } catch(e){}
+async function saveSeen(set) {
+  try {
+    await fetch(`${DB_URL}/bot_seen.json?key=${API_KEY}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([...set])
+    });
+  } catch(e) { console.error('[Seen] Save error:', e.message); }
 }
 
 // ── Firebase ──
@@ -122,7 +133,7 @@ async function postMovie(m) {
 // ══════════════════════════════════════
 // MAIN
 // ══════════════════════════════════════
-let seen    = loadSeen();
+let seen    = new Set();
 let isFirst = true;
 
 async function check() {
@@ -132,10 +143,13 @@ async function check() {
     console.log(`[Firebase] Got ${movies.length} movies`);
 
     if (isFirst) {
+      // Load seen list from Firebase
+      seen = await loadSeen();
+      console.log(`[Seen] Loaded ${seen.size} seen movies from Firebase`);
       // Mark all existing as seen on startup
       let count = 0;
       movies.forEach(m => { if (!seen.has(m.id)) { seen.add(m.id); count++; } });
-      saveSeen(seen);
+      await await saveSeen(seen);
       isFirst = false;
       console.log(`✅ Startup done. Marked ${count} movies as seen. Watching for new ones...`);
 
@@ -163,7 +177,7 @@ async function check() {
       const ok = await postMovie(m);
       if (ok) {
         seen.add(m.id);
-        saveSeen(seen);
+        await saveSeen(seen);
         console.log(`✅ Posted: ${m.title}`);
       }
       await new Promise(r => setTimeout(r, 2000));
