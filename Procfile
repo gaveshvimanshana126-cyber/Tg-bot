@@ -1,1 +1,1 @@
-worker: node autopost.js
+node index.js
