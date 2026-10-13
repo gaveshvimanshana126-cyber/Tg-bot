@@ -26,7 +26,7 @@ TMDB_TOKEN = os.environ["TMDB_TOKEN"]  # TMDB "API Read Access Token"
 CHANNEL_ID = os.environ["CHANNEL_ID"]  # e.g. -1001234567890 or @yourchannel
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 
-DEFAULT_DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "https://moviemanialk.com")
+DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "https://moviemanialk.com")  # fixed for every post
 WHATSAPP_URL = os.environ.get(
     "WHATSAPP_URL", "https://whatsapp.com/channel/0029Vb6dIi242DccwGQfTr2R"
 )
@@ -97,6 +97,7 @@ def build_caption(d: dict, media_type: str) -> str:
     ]
     if overview:
         lines += ["", f"📝 <i>{e(overview)}</i>"]
+    lines += ["", "🇱🇰 <b>සිංහල උපසිරස සමග Download කරගැනිමට හා Online නැරඹිමට පිවිසෙන්න</b> 👇"]
     return "\n".join(lines)
 
 
@@ -141,7 +142,7 @@ def is_admin(update: Update) -> bool:
 # ---------- HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        await update.message.reply_text("⛔ මේ bot එක admin ලාට විතරයි.")
+        await update.message.reply_text("⛔admin only.")
         return
     await update.message.reply_text(
         "👋 Admin Panel\n\nMovie / TV series නමක් type කරන්න 🔎"
@@ -156,27 +157,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     text = update.message.text.strip()
-
-    # Step 3: admin sends the download link
-    if context.user_data.get("state") == "await_link":
-        url = DEFAULT_DOWNLOAD_URL if text.lower() == "/skip" else text
-        if not url.startswith("http"):
-            await update.message.reply_text("❌ Link එක http:// හෝ https:// වලින් පටන් ගන්න ඕනේ. නැත්නම් /skip")
-            return
-        context.user_data["download_url"] = url
-        context.user_data["state"] = "await_confirm"
-        post = context.user_data["post"]
-        await send_post(context.bot, update.effective_chat.id, post, url)
-        await update.message.reply_text(
-            "👆 Preview එක. Channel එකට යවමුද?",
-            reply_markup=InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton("✅ Post to Channel", callback_data="post"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-                ]]
-            ),
-        )
-        return
 
     # Step 1: search
     context.user_data.clear()
@@ -222,9 +202,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "poster": poster,
             "trailer": trailer_url(d),
         }
-        context.user_data["state"] = "await_link"
+        context.user_data["download_url"] = DOWNLOAD_URL
+        await send_post(context.bot, update.effective_chat.id, context.user_data["post"], DOWNLOAD_URL)
         await q.message.reply_text(
-            "🔗 Download link එක එවන්න.\n(Default site එක use කරන්න /skip)"
+            "👆 Preview එක. Channel එකට යවමුද?",
+            reply_markup=InlineKeyboardMarkup(
+                [[
+                    InlineKeyboardButton("✅ Post to Channel", callback_data="post"),
+                    InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+                ]]
+            ),
         )
 
     elif data == "post":
@@ -250,7 +237,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
-    app.add_handler(CommandHandler("skip", on_text))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot started")
