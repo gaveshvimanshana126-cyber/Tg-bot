@@ -69,45 +69,83 @@ async def details(media_type: str, tmdb_id: int):
 
 
 # ---------- POST BUILDER ----------
-def build_caption(d: dict, media_type: str) -> str:
+SEP = "━━━━━━━━━━━━━━━━━━"
+SINHALA_LINE = "🇱🇰 <b>සිංහල උපසිරස සමග Download කරගැනිමට හා Online නැරඹිමට පිවිසෙන්න</b> 👇"
+
+
+def stars(rating: float) -> str:
+    full = int(round(rating / 2))
+    return "★" * full + "☆" * (5 - full)
+
+
+def hashtags(genres: list, year: str) -> str:
+    tags = []
+    for g in genres[:3]:
+        t = "".join(ch for ch in g.title() if ch.isalnum())
+        if t:
+            tags.append("#" + t)
+    tags.append("#SinhalaSub")
+    if year:
+        tags.append(f"#{year}")
+    return " ".join(tags)
+
+
+def render_card(title, year, kind, rating, genres, runtime, quality, country,
+                director, cast, overview) -> str:
     e = html.escape
+    head = f"{kind} <b>{e(title.upper())}</b>" + (f" <i>({e(str(year))})</i>" if year else "")
+    lines = [head, SEP]
+    if rating:
+        lines.append(f"⭐ <b>{rating:.1f}</b>/10  {stars(rating)}")
+    if genres:
+        lines.append("🎭 " + " • ".join(e(g) for g in genres))
+    meta = []
+    if runtime:
+        meta.append(f"⏱ {e(str(runtime))}")
+    if quality:
+        meta.append(f"💿 {e(str(quality))}")
+    if country:
+        meta.append(f"🌍 {e(str(country))}")
+    if meta:
+        lines.append("  |  ".join(meta))
+    lines.append(SEP)
+    if director:
+        lines.append(f"🎥 <b>Director:</b> {e(str(director))}")
+    if cast:
+        lines.append(f"👥 <b>Cast:</b> {e(str(cast))}")
+
+    tail = ["", SINHALA_LINE, "", hashtags(genres, str(year or ""))]
+    overview = (overview or "").strip()
+    limit = 300
+    while True:
+        body = list(lines)
+        if overview:
+            ov = overview if len(overview) <= limit else overview[: limit - 3].rsplit(" ", 1)[0] + "..."
+            body += ["", f"<blockquote expandable>📝 {e(ov)}</blockquote>"]
+        text = "\n".join(body + tail)
+        if len(text) <= 1024 or limit <= 60:
+            return text
+        limit -= 40
+
+
+def build_caption(d: dict, media_type: str) -> str:
     title = d.get("title") or d.get("name") or "Unknown"
     date = d.get("release_date") or d.get("first_air_date") or ""
-    year = date[:4]
-    rating = d.get("vote_average") or 0
-    genres = ", ".join(g["name"] for g in d.get("genres", [])) or "N/A"
-    lang = (d.get("original_language") or "").upper()
-
     if media_type == "movie":
         mins = d.get("runtime") or 0
-        runtime = f"{mins // 60}h {mins % 60}m" if mins else "N/A"
+        runtime = f"{mins // 60}h {mins % 60}m" if mins else ""
     else:
         eps = d.get("episode_run_time") or []
-        runtime = f"{eps[0]}m / ep" if eps else "N/A"
-
+        runtime = f"{eps[0]}m / ep" if eps else ""
     credits = d.get("credits", {})
-    cast = ", ".join(c["name"] for c in credits.get("cast", [])[:5]) or "N/A"
+    cast = ", ".join(c["name"] for c in credits.get("cast", [])[:5])
     directors = [c["name"] for c in credits.get("crew", []) if c.get("job") == "Director"]
-    director = ", ".join(directors[:2]) or "N/A"
-
-    overview = (d.get("overview") or "").strip()
-    if len(overview) > 350:
-        overview = overview[:347].rsplit(" ", 1)[0] + "..."
-
-    lines = [
-        f"🎬 <b>{e(title)}</b> ({e(year)})" if year else f"🎬 <b>{e(title)}</b>",
-        "",
-        f"⭐ <b>Rating:</b> {rating:.1f}/10",
-        f"🎭 <b>Genre:</b> {e(genres)}",
-        f"⏱ <b>Runtime:</b> {e(runtime)}",
-        f"🌐 <b>Language:</b> {e(lang)}",
-        f"🎥 <b>Director:</b> {e(director)}",
-        f"👥 <b>Cast:</b> {e(cast)}",
-    ]
-    if overview:
-        lines += ["", f"📝 <i>{e(overview)}</i>"]
-    lines += ["", "🇱🇰 <b>සිංහල උපසිරස සමග Download කරගැනිමට හා Online නැරඹිමට පිවිසෙන්න</b> 👇"]
-    return "\n".join(lines)
+    return render_card(
+        title, date[:4], "🎬" if media_type == "movie" else "📺",
+        d.get("vote_average") or 0,
+        [g["name"] for g in d.get("genres", [])],
+        runtime, "", "", ", ".join(directors[:2]), cast, d.get("overview"),
+    )
 
 
 def trailer_url(d: dict):
@@ -118,15 +156,16 @@ def trailer_url(d: dict):
 
 
 def post_keyboard(download_url: str, trailer: str | None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("📥 Download Now", url=download_url)]]
+    rows = [[
+        InlineKeyboardButton("📥 Download Now", url=download_url),
+        InlineKeyboardButton("▶️ Watch Online", url=download_url),
+    ]]
     if trailer:
-        rows.append([InlineKeyboardButton("▶️ Trailer", url=trailer)])
-    rows.append(
-        [
-            InlineKeyboardButton("💬 WhatsApp Channel", url=WHATSAPP_URL),
-            InlineKeyboardButton("👍 Facebook Page", url=FB_URL),
-        ]
-    )
+        rows.append([InlineKeyboardButton("🎞 Watch Trailer", url=trailer)])
+    rows.append([
+        InlineKeyboardButton("💬 WhatsApp", url=WHATSAPP_URL),
+        InlineKeyboardButton("👍 Facebook", url=FB_URL),
+    ])
     return InlineKeyboardMarkup(rows)
 
 
@@ -151,10 +190,29 @@ def is_admin(update: Update) -> bool:
 # ---------- HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        await update.message.reply_text("⛔ මේ bot එක admin ලාට විතරයි.")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 Website", url=SITE_URL)],
+            [
+                InlineKeyboardButton("💬 WhatsApp", url=WHATSAPP_URL),
+                InlineKeyboardButton("👍 Facebook", url=FB_URL),
+            ],
+        ])
+        await update.message.reply_text(
+            "🎬 <b>MovieMania LK</b>\n\n"
+            "සිංහල උපසිරස සමග Movies & TV Series 🇱🇰\n\n"
+            "📩 ඔයාට ඕන Movie / Series එකේ නම මෙතන type කරන්න, අපි ඒක add කරන්නම්!",
+            parse_mode="HTML", reply_markup=kb,
+        )
         return
     await update.message.reply_text(
-        "👋 Admin Panel\n\nMovie / TV series නමක් type කරන්න 🔎"
+        "👋 <b>Admin Panel</b>\n\n"
+        "🔎 Movie / TV series නමක් type කරලා manual post එකක් හදන්න\n\n"
+        "<b>Commands</b>\n"
+        "/autopost on|off – auto post පාලනය\n"
+        "/stats – සංඛ්‍යා ලේඛන\n"
+        "/last – අන්තිමට post කළ 5\n"
+        "/repost &lt;id&gt; – movie එකක් ආයෙ post කරන්න",
+        parse_mode="HTML",
     )
 
 
@@ -164,6 +222,7 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await handle_request(update, context)
         return
     text = update.message.text.strip()
 
@@ -242,6 +301,116 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Cancel කළා.")
 
 
+# ---------- PREMIUM EXTRAS ----------
+AUTOPOST = True
+REQ_COOLDOWN = 60
+_last_req: dict = {}
+
+
+async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = (update.message.text or "").strip()[:100]
+    if not text:
+        return
+    now = time.time()
+    wait = REQ_COOLDOWN - (now - _last_req.get(user.id, 0))
+    if wait > 0:
+        await update.message.reply_text(f"⏳ තව තත්පර {int(wait)}කින් ආයෙ request කරන්න.")
+        return
+    _last_req[user.id] = now
+    name = html.escape(user.full_name or "User")
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin,
+                f"📩 <b>New Request</b>\n🎬 {html.escape(text)}\n"
+                f"👤 <a href=\"tg://user?id={user.id}\">{name}</a>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    await update.message.reply_text(
+        "✅ ඔයාගේ request එක ලැබුණා!\nඅපි ඉක්මනින් site එකට add කරලා channel එකේ post කරන්නම් 🎬"
+    )
+
+
+async def autopost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global AUTOPOST
+    if not is_admin(update):
+        return
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "off"):
+        AUTOPOST = arg == "on"
+        try:
+            await fb_put("telegram_bot/autopost", AUTOPOST)
+        except Exception:
+            log.warning("could not save autopost setting")
+    state = "ON ✅" if AUTOPOST else "OFF ⏸"
+    await update.message.reply_text(f"🤖 Auto post: {state}\n\n/autopost on  |  /autopost off")
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    try:
+        keys = await fb_get("movies", shallow="true") or {}
+        hist = await fb_get("telegram_bot/history") or {}
+    except Exception:
+        await update.message.reply_text("⚠️ Firebase error.")
+        return
+    now_ms = time.time() * 1000
+    items = [h for h in hist.values() if isinstance(h, dict)]
+    today = sum(1 for h in items if now_ms - float(h.get("ts", 0)) < 86400000)
+    await update.message.reply_text(
+        "📊 <b>Stats</b>\n\n"
+        f"🎞 Site එකේ titles: <b>{len(keys)}</b>\n"
+        f"📤 Bot post කළ: <b>{len(items)}</b>\n"
+        f"🕐 පසුගිය පැය 24: <b>{today}</b>\n"
+        f"🤖 Auto post: <b>{'ON' if AUTOPOST else 'OFF'}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    try:
+        hist = await fb_get("telegram_bot/history") or {}
+    except Exception:
+        await update.message.reply_text("⚠️ Firebase error.")
+        return
+    items = sorted(
+        (h for h in hist.values() if isinstance(h, dict)),
+        key=lambda h: float(h.get("ts", 0)), reverse=True,
+    )[:5]
+    if not items:
+        await update.message.reply_text("තාම post history එකක් නෑ.")
+        return
+    lines = ["🕘 <b>Last posts</b>\n"]
+    for i, h in enumerate(items, 1):
+        lines.append(f"{i}. {html.escape(str(h.get('title', '?')))}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def repost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /repost movie-id\n(උදා: /repost buddy-21)")
+        return
+    movie_id = context.args[0]
+    try:
+        m = await fb_get(f"movies/{movie_id}")
+        if not isinstance(m, dict):
+            await update.message.reply_text("❌ ඒ ID එකෙන් movie එකක් නෑ.")
+            return
+        await post_site_movie(context.bot, movie_id, m)
+        await update.message.reply_text(f"✅ Reposted: {m.get('title')}")
+    except Exception as ex:
+        log.exception("repost failed")
+        await update.message.reply_text(f"❌ Failed: {ex}")
+
+
 # ---------- AUTO POST (admin panel -> channel) ----------
 async def fb_get(path: str, **params):
     if FIREBASE_API_KEY:
@@ -260,36 +429,17 @@ async def fb_put(path: str, value):
 
 
 def site_caption(m: dict) -> str:
-    e = html.escape
-    title = m.get("title") or "Unknown"
-    year = m.get("year") or ""
-    kind = "📺" if m.get("type") in ("tv", "series") else "🎬"
-    lines = [f"{kind} <b>{e(title)}</b>" + (f" ({e(str(year))})" if year else ""), ""]
-
-    def add(icon, label, val):
-        if val:
-            lines.append(f"{icon} <b>{label}:</b> {e(str(val))}")
-
     try:
         rating = float(m.get("rating") or 0)
-    except ValueError:
+    except (TypeError, ValueError):
         rating = 0
-    if rating:
-        lines.append(f"⭐ <b>Rating:</b> {rating:.1f}/10")
-    add("🎭", "Genre", m.get("genre"))
-    add("⏱", "Runtime", m.get("runtime"))
-    add("💿", "Quality", m.get("quality"))
-    add("🌍", "Country", m.get("country"))
-    add("🎥", "Director", m.get("director"))
-    add("👥", "Cast", m.get("cast"))
-
-    desc = (m.get("description") or "").strip()
-    if len(desc) > 300:
-        desc = desc[:297].rsplit(" ", 1)[0] + "..."
-    if desc:
-        lines += ["", f"📝 <i>{e(desc)}</i>"]
-    lines += ["", "🇱🇰 <b>සිංහල උපසිරස සමග Download කරගැනිමට හා Online නැරඹිමට පිවිසෙන්න</b> 👇"]
-    return "\n".join(lines)[:1024]
+    genres = [g.strip() for g in str(m.get("genre") or "").split(",") if g.strip()]
+    kind = "📺" if m.get("type") in ("tv", "series") else "🎬"
+    return render_card(
+        m.get("title") or "Unknown", m.get("year") or "", kind, rating, genres,
+        m.get("runtime"), m.get("quality"), m.get("country"),
+        m.get("director"), m.get("cast"), m.get("description"),
+    )
 
 
 def movie_link(movie_id: str, m: dict) -> str:
@@ -336,6 +486,13 @@ async def check_new_movies(bot, posted: set):
             await fb_put(f"{POSTED_PATH}/{movie_id}", True)
         except Exception:
             log.warning("could not persist posted flag for %s", movie_id)
+        try:
+            await fb_put(
+                f"telegram_bot/history/{movie_id}",
+                {"title": m.get("title"), "ts": int(time.time() * 1000)},
+            )
+        except Exception:
+            pass
         for admin in ADMIN_IDS:
             try:
                 await bot.send_message(admin, f"✅ Auto posted: {m.get('title')}")
@@ -349,6 +506,12 @@ async def auto_post_loop(app: Application):
         log.warning("FIREBASE_DB_URL not set - auto post disabled")
         return
     bot = app.bot
+    global AUTOPOST
+    try:
+        if await fb_get("telegram_bot/autopost") is False:
+            AUTOPOST = False
+    except Exception:
+        pass
     # Load already-posted ids. First ever run: mark everything existing as posted
     # so the channel is not flooded with old movies.
     try:
@@ -369,7 +532,8 @@ async def auto_post_loop(app: Application):
 
     while True:
         try:
-            await check_new_movies(bot, posted)
+            if AUTOPOST:
+                await check_new_movies(bot, posted)
         except Exception:
             log.exception("auto post check failed")
         await asyncio.sleep(POLL_SECONDS)
@@ -383,6 +547,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("autopost", autopost_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("last", last_cmd))
+    app.add_handler(CommandHandler("repost", repost_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot started")
