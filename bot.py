@@ -1,6 +1,7 @@
 import os
 import html
 import time
+from datetime import datetime, timedelta, timezone
 import asyncio
 import logging
 
@@ -211,6 +212,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/autopost on|off – auto post පාලනය\n"
         "/stats – සංඛ්‍යා ලේඛන\n"
         "/last – අන්තිමට post කළ 5\n"
+        "/requests – members ලාගේ requests\n"
         "/repost &lt;id&gt; – movie එකක් ආයෙ post කරන්න",
         parse_mode="HTML",
     )
@@ -260,6 +262,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     data = q.data
+    if data.startswith("rq:"):
+        await handle_req_action(update, context)
+        return
 
     if data.startswith("pick:"):
         _, media_type, tmdb_id = data.split(":")
@@ -307,6 +312,55 @@ REQ_COOLDOWN = 60
 _last_req: dict = {}
 
 
+_requests: dict = {}   # rid -> record (cache)
+_req_msgs: dict = {}   # rid -> [(admin_chat_id, message_id)]
+
+STATUS_LINE = {
+    "pending": "⏳ <b>Pending</b>",
+    "seen": "👀 <b>Seen</b>",
+    "added": "✅ <b>Added</b>",
+    "rejected": "❌ <b>Not available</b>",
+}
+STATUS_ICON = {"pending": "⏳", "seen": "👀", "added": "✅", "rejected": "❌"}
+
+
+def req_text(rec: dict) -> str:
+    line = STATUS_LINE.get(rec["status"], rec["status"])
+    if rec.get("by") and rec["status"] != "pending":
+        line += f" — {html.escape(rec['by'])}"
+    return (
+        "📩 <b>New Request</b>\n"
+        f"🎬 {html.escape(rec['text'])}\n"
+        f"👤 <a href=\"tg://user?id={rec['uid']}\">{html.escape(rec['name'])}</a>\n"
+        f"📌 {line}"
+    )
+
+
+def req_keyboard(rec: dict):
+    rid, st = rec["id"], rec["status"]
+    if st == "pending":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("👀 Seen", callback_data=f"rq:seen:{rid}")],
+            [
+                InlineKeyboardButton("✅ Added", callback_data=f"rq:added:{rid}"),
+                InlineKeyboardButton("❌ Not available", callback_data=f"rq:rejected:{rid}"),
+            ],
+        ])
+    if st == "seen":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Added", callback_data=f"rq:added:{rid}"),
+            InlineKeyboardButton("❌ Not available", callback_data=f"rq:rejected:{rid}"),
+        ]])
+    return None
+
+
+async def save_req(rec: dict):
+    try:
+        await fb_put(f"telegram_bot/requests/{rec['id']}", rec)
+    except Exception:
+        log.warning("could not save request %s", rec["id"])
+
+
 async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (update.message.text or "").strip()[:100]
@@ -318,20 +372,102 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏳ තව තත්පර {int(wait)}කින් ආයෙ request කරන්න.")
         return
     _last_req[user.id] = now
-    name = html.escape(user.full_name or "User")
+
+    rec = {
+        "id": str(int(now * 1000)), "uid": user.id, "name": user.full_name or "User",
+        "text": text, "status": "pending", "ts": int(now * 1000),
+    }
+    _requests[rec["id"]] = rec
+    _req_msgs[rec["id"]] = []
     for admin in ADMIN_IDS:
         try:
-            await context.bot.send_message(
-                admin,
-                f"📩 <b>New Request</b>\n🎬 {html.escape(text)}\n"
-                f"👤 <a href=\"tg://user?id={user.id}\">{name}</a>",
-                parse_mode="HTML",
+            msg = await context.bot.send_message(
+                admin, req_text(rec), parse_mode="HTML", reply_markup=req_keyboard(rec)
+            )
+            _req_msgs[rec["id"]].append((admin, msg.message_id))
+        except Exception:
+            pass
+    await save_req(rec)
+    await update.message.reply_text(
+        "✅ ඔයාගේ request එක ලැබුණා!\nAdmin දැක්කම ඔයාට දැනුම් දෙන්නම් 🎬"
+    )
+
+
+async def handle_req_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    _, action, rid = q.data.split(":", 2)
+    rec = _requests.get(rid)
+    if rec is None:
+        try:
+            rec = await fb_get(f"telegram_bot/requests/{rid}")
+        except Exception:
+            rec = None
+    if not isinstance(rec, dict):
+        await q.edit_message_text("⚠️ ඒ request එක හොයාගන්න බෑ.")
+        return
+    _requests[rid] = rec
+    if rec["status"] == action or rec["status"] in ("added", "rejected"):
+        try:
+            await q.answer("දැනටමත් update කරලා ✔️")
+        except Exception:
+            pass
+        return
+
+    rec["status"] = action
+    rec["by"] = update.effective_user.first_name or "Admin"
+    await save_req(rec)
+
+    # update every admin's copy of the message
+    targets = _req_msgs.get(rid) or [(q.message.chat_id, q.message.message_id)]
+    for chat_id, msg_id in targets:
+        try:
+            await context.bot.edit_message_text(
+                req_text(rec), chat_id=chat_id, message_id=msg_id,
+                parse_mode="HTML", reply_markup=req_keyboard(rec),
             )
         except Exception:
             pass
-    await update.message.reply_text(
-        "✅ ඔයාගේ request එක ලැබුණා!\nඅපි ඉක්මනින් site එකට add කරලා channel එකේ post කරන්නම් 🎬"
+
+    # tell the member
+    title = html.escape(rec["text"])
+    kb = None
+    if action == "seen":
+        msg = f"👀 <b>ඔයාගේ request එක admin දැක්කා!</b>\n🎬 {title}\nඉක්මනින් add කරන්නම්."
+    elif action == "added":
+        msg = f"✅ <b>ඔයාගේ request එක add කළා!</b>\n🎬 {title}\nදැන් site එකෙන් බලන්න 👇"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Open Website", url=SITE_URL)]])
+    else:
+        msg = f"❌ සමාවෙන්න, <b>{title}</b> දැනට ලබාගන්න අමාරුයි."
+    try:
+        await context.bot.send_message(rec["uid"], msg, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        try:
+            await q.answer("Member ට message යවන්න බැරි වුණා", show_alert=True)
+        except Exception:
+            pass
+
+
+async def requests_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    try:
+        data = await fb_get("telegram_bot/requests", orderBy='"$key"', limitToLast="10") or {}
+    except Exception:
+        await update.message.reply_text("⚠️ Firebase error.")
+        return
+    recs = sorted(
+        (r for r in data.values() if isinstance(r, dict)),
+        key=lambda r: num(r.get("ts")), reverse=True,
     )
+    if not recs:
+        await update.message.reply_text("📭 Requests නෑ.")
+        return
+    pending = sum(1 for r in recs if r.get("status") in ("pending", "seen"))
+    lines = [f"📩 <b>Requests</b> (අන්තිම {len(recs)}, pending: {pending})\n"]
+    for r in recs:
+        icon = STATUS_ICON.get(r.get("status"), "•")
+        lines.append(f"{icon} {html.escape(str(r.get('text')))} — {html.escape(str(r.get('name')))}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def autopost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,26 +485,92 @@ async def autopost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Auto post: {state}\n\n/autopost on  |  /autopost off")
 
 
+def num(v) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def fmt(n: int) -> str:
+    return f"{n:,}"
+
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
+    wait = await update.message.reply_text("⏳ Stats ගන්නවා...")
     try:
-        keys = await fb_get("movies", shallow="true") or {}
+        movies = await fb_get("movies") or {}
+        deleted = await fb_get("analytics/deletedStats") or {}
+        visitors_total = num(await fb_get("analytics/totalVisitors"))
         hist = await fb_get("telegram_bot/history") or {}
+        daily = {}
+        for name in ("viewsDaily", "downloadsDaily", "onlineWatchDaily", "visitorsDaily"):
+            daily[name] = await fb_get(
+                f"analytics/{name}", orderBy='"$key"', limitToLast="7"
+            ) or {}
     except Exception:
-        await update.message.reply_text("⚠️ Firebase error.")
+        log.exception("stats failed")
+        await wait.edit_text("⚠️ Firebase error. පස්සේ try කරන්න.")
         return
+
+    items = [(k, v) for k, v in movies.items() if isinstance(v, dict)]
+    views = sum(num(v.get("views")) for _, v in items) + num(deleted.get("totalViews"))
+    dls = sum(num(v.get("downloads_count")) for _, v in items) + num(deleted.get("totalDownloads"))
+    watch = sum(num(v.get("online_watch")) for _, v in items) + num(deleted.get("totalOnlineWatch"))
+
+    # site stores day keys as YYYY-MM-DD (Sri Lanka time)
+    lk = timezone(timedelta(hours=5, minutes=30))
+    today_key = datetime.now(lk).strftime("%Y-%m-%d")
+    week_keys = [(datetime.now(lk) - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+    def today(name):
+        return num(daily[name].get(today_key))
+
+    def week(name):
+        return sum(num(daily[name].get(k)) for k in week_keys)
+
     now_ms = time.time() * 1000
-    items = [h for h in hist.values() if isinstance(h, dict)]
-    today = sum(1 for h in items if now_ms - float(h.get("ts", 0)) < 86400000)
-    await update.message.reply_text(
-        "📊 <b>Stats</b>\n\n"
-        f"🎞 Site එකේ titles: <b>{len(keys)}</b>\n"
-        f"📤 Bot post කළ: <b>{len(items)}</b>\n"
-        f"🕐 පසුගිය පැය 24: <b>{today}</b>\n"
-        f"🤖 Auto post: <b>{'ON' if AUTOPOST else 'OFF'}</b>",
-        parse_mode="HTML",
-    )
+    hist_items = [h for h in hist.values() if isinstance(h, dict)]
+    posted_24h = sum(1 for h in hist_items if now_ms - num(h.get("ts")) < 86400000)
+
+    def top(field, n):
+        ranked = sorted(items, key=lambda kv: num(kv[1].get(field)), reverse=True)[:n]
+        return [
+            f"{i}. {html.escape(str(v.get('title', k)))} — <b>{fmt(num(v.get(field)))}</b>"
+            for i, (k, v) in enumerate(ranked, 1) if num(v.get(field)) > 0
+        ]
+
+    lines = [
+        "📊 <b>MovieMania Stats</b>",
+        SEP,
+        f"🎞 Titles: <b>{fmt(len(items))}</b>   📤 Bot posts: <b>{fmt(len(hist_items))}</b>",
+        "",
+        "🏆 <b>All time</b>",
+        f"👁 Views: <b>{fmt(views)}</b>",
+        f"📥 Downloads: <b>{fmt(dls)}</b>",
+        f"▶️ Online Watch: <b>{fmt(watch)}</b>",
+        f"👥 Visitors: <b>{fmt(visitors_total)}</b>",
+        "",
+        "📅 <b>Today</b>",
+        f"👁 {fmt(today('viewsDaily'))}  |  📥 {fmt(today('downloadsDaily'))}  |  "
+        f"▶️ {fmt(today('onlineWatchDaily'))}  |  👥 {fmt(today('visitorsDaily'))}",
+        "",
+        "📆 <b>Last 7 days</b>",
+        f"👁 {fmt(week('viewsDaily'))}  |  📥 {fmt(week('downloadsDaily'))}  |  "
+        f"▶️ {fmt(week('onlineWatchDaily'))}  |  👥 {fmt(week('visitorsDaily'))}",
+    ]
+    tv, td = top("views", 5), top("downloads_count", 3)
+    if tv:
+        lines += ["", "🔥 <b>Top viewed</b>"] + tv
+    if td:
+        lines += ["", "⬇️ <b>Top downloaded</b>"] + td
+    lines += [
+        "", SEP,
+        f"🤖 Auto post: <b>{'ON' if AUTOPOST else 'OFF'}</b>   🕐 Posted 24h: <b>{posted_24h}</b>",
+    ]
+    await wait.edit_text("\n".join(lines), parse_mode="HTML")
 
 
 async def last_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -551,6 +753,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("last", last_cmd))
     app.add_handler(CommandHandler("repost", repost_cmd))
+    app.add_handler(CommandHandler("requests", requests_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot started")
