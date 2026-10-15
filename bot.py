@@ -42,6 +42,7 @@ FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://cineflix1-1fdc6-def
 FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "AIzaSyAh6zMB65iWqt3R2Ep0C5_7eV8ZaUHI7t8")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
 SITE_URL = os.environ.get("SITE_URL", "https://www.moviemanialk.com").rstrip("/")
+REQUEST_BOT_URL = os.environ.get("REQUEST_BOT_URL", "https://t.me/Moviemanialkrequest_bot")
 POSTED_PATH = "telegram_bot/posted"
 
 TMDB = "https://api.themoviedb.org/3"
@@ -156,16 +157,27 @@ def trailer_url(d: dict):
     return None
 
 
+def btn(text: str, url: str, style: str | None = None) -> InlineKeyboardButton:
+    """URL button with optional colour: primary=blue, success=green, danger=red."""
+    if not style:
+        return InlineKeyboardButton(text, url=url)
+    try:
+        return InlineKeyboardButton(text, url=url, style=style)
+    except TypeError:  # older python-telegram-bot without native `style`
+        return InlineKeyboardButton(text, url=url, api_kwargs={"style": style})
+
+
 def post_keyboard(download_url: str, trailer: str | None) -> InlineKeyboardMarkup:
     rows = [[
-        InlineKeyboardButton("📥 Download Now", url=download_url),
-        InlineKeyboardButton("▶️ Watch Online", url=download_url),
+        btn("📥 Download Now", download_url, "primary"),   # blue
+        btn("▶️ Watch Online", download_url, "danger"),    # red
     ]]
     if trailer:
-        rows.append([InlineKeyboardButton("🎞 Watch Trailer", url=trailer)])
+        rows.append([btn("🎞 Watch Trailer", trailer)])
+    rows.append([btn("🎬 Request Movie", REQUEST_BOT_URL, "success")])  # green
     rows.append([
-        InlineKeyboardButton("💬 WhatsApp", url=WHATSAPP_URL),
-        InlineKeyboardButton("👍 Facebook", url=FB_URL),
+        btn("💬 WhatsApp", WHATSAPP_URL, "success"),       # green
+        btn("👍 Facebook", FB_URL, "primary"),             # blue
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -192,10 +204,10 @@ def is_admin(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🌐 Website", url=SITE_URL)],
+            [btn("🌐 Website", SITE_URL, "primary")],
             [
-                InlineKeyboardButton("💬 WhatsApp", url=WHATSAPP_URL),
-                InlineKeyboardButton("👍 Facebook", url=FB_URL),
+                btn("💬 WhatsApp", WHATSAPP_URL, "success"),
+                btn("👍 Facebook", FB_URL, "primary"),
             ],
         ])
         await update.message.reply_text(
