@@ -1,5 +1,7 @@
 import os
 import html
+import time
+import asyncio
 import logging
 
 import httpx
@@ -33,6 +35,13 @@ WHATSAPP_URL = os.environ.get(
 FB_URL = os.environ.get(
     "FB_URL", "https://www.facebook.com/profile.php?id=61578959931824"
 )
+
+# ---- Auto-post (Firebase admin panel) ----
+FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://cineflix1-1fdc6-default-rtdb.firebaseio.com").rstrip("/")
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "AIzaSyAh6zMB65iWqt3R2Ep0C5_7eV8ZaUHI7t8")
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
+SITE_URL = os.environ.get("SITE_URL", "https://www.moviemanialk.com").rstrip("/")
+POSTED_PATH = "telegram_bot/posted"
 
 TMDB = "https://api.themoviedb.org/3"
 IMG = "https://image.tmdb.org/t/p/w500"
@@ -142,7 +151,7 @@ def is_admin(update: Update) -> bool:
 # ---------- HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        await update.message.reply_text("⛔admin only.")
+        await update.message.reply_text("⛔ මේ bot එක admin ලාට විතරයි.")
         return
     await update.message.reply_text(
         "👋 Admin Panel\n\nMovie / TV series නමක් type කරන්න 🔎"
@@ -233,8 +242,145 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Cancel කළා.")
 
 
+# ---------- AUTO POST (admin panel -> channel) ----------
+async def fb_get(path: str, **params):
+    if FIREBASE_API_KEY:
+        params["key"] = FIREBASE_API_KEY
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{FIREBASE_DB_URL}/{path}.json", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+async def fb_put(path: str, value):
+    params = {"key": FIREBASE_API_KEY} if FIREBASE_API_KEY else {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.put(f"{FIREBASE_DB_URL}/{path}.json", params=params, json=value)
+        r.raise_for_status()
+
+
+def site_caption(m: dict) -> str:
+    e = html.escape
+    title = m.get("title") or "Unknown"
+    year = m.get("year") or ""
+    kind = "📺" if m.get("type") in ("tv", "series") else "🎬"
+    lines = [f"{kind} <b>{e(title)}</b>" + (f" ({e(str(year))})" if year else ""), ""]
+
+    def add(icon, label, val):
+        if val:
+            lines.append(f"{icon} <b>{label}:</b> {e(str(val))}")
+
+    try:
+        rating = float(m.get("rating") or 0)
+    except ValueError:
+        rating = 0
+    if rating:
+        lines.append(f"⭐ <b>Rating:</b> {rating:.1f}/10")
+    add("🎭", "Genre", m.get("genre"))
+    add("⏱", "Runtime", m.get("runtime"))
+    add("💿", "Quality", m.get("quality"))
+    add("🌍", "Country", m.get("country"))
+    add("🎥", "Director", m.get("director"))
+    add("👥", "Cast", m.get("cast"))
+
+    desc = (m.get("description") or "").strip()
+    if len(desc) > 300:
+        desc = desc[:297].rsplit(" ", 1)[0] + "..."
+    if desc:
+        lines += ["", f"📝 <i>{e(desc)}</i>"]
+    lines += ["", "🇱🇰 <b>සිංහල උපසිරස සමග Download කරගැනිමට හා Online නැරඹිමට පිවිසෙන්න</b> 👇"]
+    return "\n".join(lines)[:1024]
+
+
+def movie_link(movie_id: str, m: dict) -> str:
+    kind = "tv" if m.get("type") in ("tv", "series") else "movie"
+    return f"{SITE_URL}/{kind}/{movie_id}-sinhala-subtitles"
+
+
+async def post_site_movie(bot, movie_id: str, m: dict):
+    caption = site_caption(m)
+    kb = post_keyboard(movie_link(movie_id, m), (m.get("trailer") or "").strip() or None)
+    poster = (m.get("poster") or m.get("backdrop") or "").strip()
+    if poster.startswith("http"):
+        try:
+            await bot.send_photo(CHANNEL_ID, poster, caption=caption, parse_mode="HTML", reply_markup=kb)
+            return
+        except Exception:
+            log.exception("photo failed, sending text")
+    await bot.send_message(CHANNEL_ID, caption, parse_mode="HTML", reply_markup=kb)
+
+
+def is_due(m: dict) -> bool:
+    sched = m.get("scheduledAt")
+    return not sched or float(sched) <= time.time() * 1000
+
+
+async def check_new_movies(bot, posted: set):
+    keys = await fb_get("movies", shallow="true") or {}
+    for movie_id in keys:
+        if movie_id in posted:
+            continue
+        m = await fb_get(f"movies/{movie_id}")
+        if not isinstance(m, dict) or not is_due(m):
+            continue  # scheduled for later - check again next round
+        if m.get("adult"):
+            posted.add(movie_id)  # never auto-post adult content
+            continue
+        try:
+            await post_site_movie(bot, movie_id, m)
+        except Exception:
+            log.exception("auto post failed: %s", movie_id)
+            continue
+        posted.add(movie_id)
+        try:
+            await fb_put(f"{POSTED_PATH}/{movie_id}", True)
+        except Exception:
+            log.warning("could not persist posted flag for %s", movie_id)
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(admin, f"✅ Auto posted: {m.get('title')}")
+            except Exception:
+                pass
+        await asyncio.sleep(3)  # Telegram flood control
+
+
+async def auto_post_loop(app: Application):
+    if not FIREBASE_DB_URL:
+        log.warning("FIREBASE_DB_URL not set - auto post disabled")
+        return
+    bot = app.bot
+    # Load already-posted ids. First ever run: mark everything existing as posted
+    # so the channel is not flooded with old movies.
+    try:
+        saved = await fb_get(POSTED_PATH)
+        if saved is None:
+            keys = await fb_get("movies", shallow="true") or {}
+            posted = set(keys)
+            try:
+                await fb_put(POSTED_PATH, {k: True for k in posted} or {"_init": True})
+            except Exception:
+                log.warning("Firebase write not allowed - posted list kept in memory only")
+        else:
+            posted = set(saved)
+    except Exception:
+        log.exception("auto post init failed")
+        return
+    log.info("Auto post started (%d known movies)", len(posted))
+
+    while True:
+        try:
+            await check_new_movies(bot, posted)
+        except Exception:
+            log.exception("auto post check failed")
+        await asyncio.sleep(POLL_SECONDS)
+
+
+async def post_init(app: Application):
+    asyncio.create_task(auto_post_loop(app))
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CallbackQueryHandler(on_callback))
