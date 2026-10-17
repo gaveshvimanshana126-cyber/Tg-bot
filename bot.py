@@ -251,6 +251,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
 
+    if context.user_data.get("state") in ("dl_tg", "dl_url", "dl_size"):
+        await handle_dl_input(update, context, text)
+        return
+
     # Add-to-site flow (waiting for links / player / description / subtitle by ...)
     if context.user_data.get("state") in ("add_links", "add_sub", "add_desc", "add_subby", "add_player"):
         await handle_add_input(update, context, text)
@@ -902,14 +906,20 @@ def draft_summary(dr: dict, meta: dict) -> str:
 
 
 def draft_keyboard(dr: dict) -> InlineKeyboardMarkup:
+    have = {x["res"] for x in dr["downloads"]}
+    res_row = [
+        InlineKeyboardButton(f"{'✅' if r in have else '➕'} {r}", callback_data=f"add:dl:{r[:-1]}")
+        for r in ("480p", "720p", "1080p")
+    ]
     return InlineKeyboardMarkup([
+        res_row,
+        [
+            InlineKeyboardButton("🔗 Bulk links", callback_data="add:links"),
+            InlineKeyboardButton("▶️ Player", callback_data="add:player"),
+        ],
         [
             InlineKeyboardButton(f"💿 {dr['quality']}", callback_data="add:qual"),
             InlineKeyboardButton(f"⭐ VIP: {'ON' if dr['isVip'] else 'OFF'}", callback_data="add:vip"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Links", callback_data="add:links"),
-            InlineKeyboardButton("▶️ Player", callback_data="add:player"),
         ],
         [
             InlineKeyboardButton("📝 Description", callback_data="add:desc"),
@@ -922,6 +932,109 @@ def draft_keyboard(dr: dict) -> InlineKeyboardMarkup:
             cbtn("❌ Cancel", "add:cancel", "danger"),
         ],
     ])
+
+
+def norm_tg(text: str):
+    t = text.strip()
+    if re.match(r"^(?:t\.me|telegram\.me)/", t, re.I):
+        t = "https://" + t
+    return t if t.startswith("http") else None
+
+
+def norm_size(text: str):
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(GB|MB|G|M)?", text, re.I)
+    if not m:
+        return None
+    unit = (m.group(2) or "GB").upper()
+    return f"{m.group(1)} {'GB' if unit.startswith('G') else 'MB'}"
+
+
+def players_from_downloads(downloads: list) -> list:
+    out = []
+    for x in downloads:
+        pdv = pd_convert(x.get("url", ""))
+        if "pixeldrain.com/api/file/" in pdv:
+            out.append({"name": "MovieManiaLK", "quality": x["res"], "url": pdv, "type": "direct"})
+    return out
+
+
+async def handle_dl_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """One resolution at a time: Telegram link -> download URL -> size."""
+    ud = context.user_data
+    dr = ud.get("draft")
+    res = ud.get("dl_res")
+    if not dr or not res:
+        ud.clear()
+        await update.message.reply_text("⚠️ Session expire. ආයෙ /add කරන්න.")
+        return
+    tmp = ud.setdefault("dl_tmp", {})
+    skip = text.lower() in ("/skip", "skip", "-")
+    st = ud["state"]
+
+    if st == "dl_tg":
+        if not skip:
+            tg = norm_tg(text)
+            if not tg:
+                await update.message.reply_text("❌ t.me link එකක් එවන්න (නැත්නම් /skip).")
+                return
+            tmp["tg"] = tg
+        ud["state"] = "dl_url"
+        await update.message.reply_text(
+            f"🔗 <b>{res}</b> — Download URL එක එවන්න." + ("\n(t.me link එක දුන්නා, URL එක නැත්නම් /skip)" if tmp.get("tg") else ""),
+            parse_mode="HTML",
+        )
+        return
+
+    if st == "dl_url":
+        if text.lower() == "remove":
+            dr["downloads"] = [x for x in dr["downloads"] if x["res"] != res]
+            if not ud.get("draft_meta", {}).get("custom_players"):
+                dr["players"] = players_from_downloads(dr["downloads"])
+            for k in ("state", "dl_res", "dl_tmp"):
+                ud.pop(k, None)
+            await update.message.reply_text(
+                draft_summary(dr, ud.get("draft_meta", {})), parse_mode="HTML", reply_markup=draft_keyboard(dr))
+            return
+        if skip:
+            if not tmp.get("tg"):
+                await update.message.reply_text("❌ t.me link එකක්වත් නැති නිසා Download URL එක ඕනේ.")
+                return
+        else:
+            if not text.startswith("http"):
+                await update.message.reply_text("❌ Link එක http:// හෝ https:// වලින් පටන් ගන්න ඕනේ.")
+                return
+            tmp["url"] = text
+        ud["state"] = "dl_size"
+        await update.message.reply_text(
+            f"💿 <b>{res}</b> — File size එක එවන්න (උදා <code>1.5GB</code>). /skip කළොත් auto detect කරනවා.",
+            parse_mode="HTML",
+        )
+        return
+
+    # dl_size -> build the entry
+    size = None if skip else norm_size(text)
+    if not skip and not size:
+        await update.message.reply_text("❌ Size එක හරියට එවන්න (උදා 1.5GB) හෝ /skip.")
+        return
+    line = " ".join(x for x in (res, size or "", tmp.get("url", ""), tmp.get("tg", "")) if x)
+    entries, _players, det = await build_downloads(line, dr["quality"])
+    if not entries:
+        await update.message.reply_text("⚠️ Link එකක් හොයාගන්න බැරි වුණා. ආයෙ try කරන්න.")
+        return
+    dr["downloads"] = sorted(
+        [x for x in dr["downloads"] if x["res"] != res] + entries,
+        key=lambda x: num(x["res"].rstrip("p")),
+    )
+    if det:
+        dr["quality"] = det
+    for x in dr["downloads"]:  # one quality label for the whole movie
+        x["quality"] = dr["quality"]
+    if not ud.get("draft_meta", {}).get("custom_players"):
+        dr["players"] = players_from_downloads(dr["downloads"])
+    for k in ("state", "dl_res", "dl_tmp"):
+        ud.pop(k, None)
+    await update.message.reply_text(
+        draft_summary(dr, ud.get("draft_meta", {})), parse_mode="HTML", reply_markup=draft_keyboard(dr))
 
 
 LINKS_PROMPT = (
@@ -1056,8 +1169,11 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     break
         except Exception:
             pass
-        ud["draft"], ud["draft_meta"], ud["state"] = dr, meta, "add_links"
-        await q.message.reply_text(LINKS_PROMPT, parse_mode="HTML")
+        ud["draft"], ud["draft_meta"], ud["state"] = dr, meta, None
+        await q.message.reply_text(
+            draft_summary(dr, meta) + "\n\n👇 <b>480p / 720p / 1080p</b> button එබුවම links අහනවා.",
+            parse_mode="HTML", reply_markup=draft_keyboard(dr),
+        )
         return
 
     dr = ud.get("draft")
@@ -1078,6 +1194,15 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             dr["isVip"] = not dr["isVip"]
         await q.edit_message_text(draft_summary(dr, meta), parse_mode="HTML", reply_markup=draft_keyboard(dr))
+    elif action == "dl":
+        res = f"{parts[2]}p"
+        ud["dl_res"], ud["dl_tmp"], ud["state"] = res, {}, "dl_tg"
+        cur = next((x for x in dr["downloads"] if x["res"] == res), None)
+        note = f"\n\nදැනට: <code>{html.escape(cur['url'] or cur['tgLink'])[:200]}</code>\n(මකන්න ඕනේ නම් URL step එකේදී <code>remove</code> කියලා ලියන්න)" if cur else ""
+        await q.message.reply_text(
+            f"📨 <b>{res}</b> — Telegram (t.me) link එක එවන්න.\nනැත්නම් /skip{note}",
+            parse_mode="HTML",
+        )
     elif action == "links":
         ud["state"] = "add_links"
         await q.message.reply_text(LINKS_PROMPT, parse_mode="HTML")
@@ -1455,7 +1580,7 @@ async def post_init(app: Application):
     asyncio.create_task(auto_post_loop(app))
 
 
-BOT_VERSION = "2026-10-17 · site-admin v8"
+BOT_VERSION = "2026-10-17 · site-admin  v9 ultra 💔"
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
