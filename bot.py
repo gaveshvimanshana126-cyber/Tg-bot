@@ -1,5 +1,7 @@
 import os
+import re
 import html
+import random
 import time
 from datetime import datetime, timedelta, timezone
 import asyncio
@@ -42,8 +44,10 @@ FIREBASE_DB_URL = os.environ.get("FIREBASE_DB_URL", "https://cineflix1-1fdc6-def
 FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "AIzaSyAh6zMB65iWqt3R2Ep0C5_7eV8ZaUHI7t8")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
 SITE_URL = os.environ.get("SITE_URL", "https://www.moviemanialk.com").rstrip("/")
+SUB_BY = os.environ.get("SUB_BY", "Piratelk.com")
 REQUEST_BOT_URL = os.environ.get("REQUEST_BOT_URL", "https://t.me/Moviemanialkrequest_bot")
 POSTED_PATH = "telegram_bot/posted"
+POSTED: set = set()  # ids already handled (shared by auto-post + /add)
 
 TMDB = "https://api.themoviedb.org/3"
 IMG = "https://image.tmdb.org/t/p/w500"
@@ -66,7 +70,8 @@ async def search(query: str):
 
 async def details(media_type: str, tmdb_id: int):
     return await tmdb_get(
-        f"/{media_type}/{tmdb_id}", append_to_response="credits,videos"
+        f"/{media_type}/{tmdb_id}", append_to_response="credits,videos,images",
+        include_image_language="en,null",
     )
 
 
@@ -219,12 +224,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "👋 <b>Admin Panel</b>\n\n"
-        "🔎 Movie / TV series නමක් type කරලා manual post එකක් හදන්න\n\n"
+        "➕ /add – Movie එකක් site එකට add කරන්න (TMDB)\n"
+        "🔎 Movie නමක් type කරලා manual post එකක් හදන්න\n\n"
         "<b>Commands</b>\n"
         "/autopost on|off – auto post පාලනය\n"
         "/stats – සංඛ්‍යා ලේඛන\n"
         "/last – අන්තිමට post කළ 5\n"
         "/requests – members ලාගේ requests\n"
+        "/find &lt;name&gt; – site එකේ movie හොයන්න\n"
+        "/vip &lt;id&gt; – VIP on/off\n"
+        "/del &lt;id&gt; – movie delete\n"
         "/repost &lt;id&gt; – movie එකක් ආයෙ post කරන්න",
         parse_mode="HTML",
     )
@@ -239,6 +248,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_request(update, context)
         return
     text = update.message.text.strip()
+
+    if context.user_data.get("add"):
+        await add_text(update, context)
+        return
 
     # Step 1: search
     context.user_data.clear()
@@ -274,8 +287,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     data = q.data
+    if data.startswith("ad:"):
+        await add_callback(update, context)
+        return
     if data.startswith("rq:"):
         await handle_req_action(update, context)
+        return
+    if data.startswith(("add:", "del:", "vip:")):
+        await handle_site_action(update, context)
         return
 
     if data.startswith("pick:"):
@@ -288,14 +307,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "trailer": trailer_url(d),
         }
         context.user_data["download_url"] = DOWNLOAD_URL
+        context.user_data["tmdb"] = (d, media_type)
         await send_post(context.bot, update.effective_chat.id, context.user_data["post"], DOWNLOAD_URL)
         await q.message.reply_text(
-            "👆 Preview එක. Channel එකට යවමුද?",
+            "👆 Preview එක. මොකක් කරමුද?",
             reply_markup=InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton("✅ Post to Channel", callback_data="post"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
-                ]]
+                [
+                    [InlineKeyboardButton("➕ Site එකට Add කරන්න", callback_data="add:start")],
+                    [
+                        InlineKeyboardButton("📣 Channel post only", callback_data="post"),
+                        InlineKeyboardButton("❌ Cancel", callback_data="cancel"),
+                    ],
+                ]
             ),
         )
 
@@ -625,6 +648,662 @@ async def repost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Failed: {ex}")
 
 
+# ---------- ADD MOVIE FROM TELEGRAM (admin panel replacement) ----------
+LINK_STEPS = ["link480", "link720", "link1080", "sub", "dlsub"]
+STEP_PROMPT = {
+    "link480": "📥 <b>480p</b> download link එක එවන්න\n(නැත්නම් /skip)",
+    "link720": "📥 <b>720p</b> download link එක එවන්න\n(නැත්නම් /skip)",
+    "link1080": "📥 <b>1080p</b> download link එක එවන්න\n(නැත්නම් /skip)",
+    "sub": "📝 <b>Subtitle (stream)</b> .srt/.vtt link එක එවන්න\n(නැත්නම් /skip)",
+    "dlsub": "📦 <b>Subtitle download</b> (zip) link එක එවන්න\n(නැත්නම් /skip)",
+}
+QUALITIES = ["WEB-RIP", "WEB-DL", "BLURAY", "HD-RIP"]
+
+
+def slugify(t: str) -> str:
+    t = re.sub(r"['’`]", "", (t or "").lower())
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return t[:80] or "untitled"
+
+
+async def unique_movie_id(title: str) -> str:
+    base = slugify(title)
+    for _ in range(8):
+        cand = f"{base}-{random.randint(10, 99)}"
+        if await fb_get(f"movies/{cand}") is None:
+            return cand
+    return f"{base}-{str(int(time.time() * 1000))[-4:]}"
+
+
+def pd_convert(url: str) -> str:
+    url = (url or "").strip()
+    m = re.search(r"pixeldrain\.com/[ul]/([A-Za-z0-9_-]+)", url)
+    if m:
+        return f"https://pixeldrain.com/api/file/{m.group(1)}"
+    if "/api/file/" in url:
+        return url.replace("?download", "")
+    return url
+
+
+def movie_from_tmdb(d: dict) -> dict:
+    mins = d.get("runtime") or 0
+    crew = d.get("credits", {}).get("crew", [])
+    cast = d.get("credits", {}).get("cast", [])
+    vids = [v for v in d.get("videos", {}).get("results", []) if v.get("site") == "YouTube"]
+    vid = (next((v for v in vids if v.get("type") == "Trailer" and v.get("official")), None)
+           or next((v for v in vids if v.get("type") == "Trailer"), None)
+           or (vids[0] if vids else None))
+    backdrops = d.get("images", {}).get("backdrops", [])[:6]
+    img = "https://image.tmdb.org/t/p/"
+    return {
+        "title": d.get("title") or "",
+        "year": (d.get("release_date") or "")[:4],
+        "genre": ", ".join(g["name"] for g in d.get("genres", [])),
+        "runtime": f"{mins // 60}h {mins % 60}m" if mins else "",
+        "rating": f"{d['vote_average']:.1f}" if d.get("vote_average") else "",
+        "description": d.get("overview") or "",
+        "describedBy": "",
+        "poster": f"{img}original{d['poster_path']}" if d.get("poster_path") else "",
+        "backdrop": f"{img}original{d['backdrop_path']}" if d.get("backdrop_path") else "",
+        "director": ", ".join(c["name"] for c in crew if c.get("job") == "Director"),
+        "cast": ", ".join(c["name"] for c in cast[:8]),
+        "country": ", ".join(c["name"] for c in d.get("production_countries", [])),
+        "trailer": f"https://www.youtube.com/watch?v={vid['key']}" if vid else "",
+        "screenshots": [f"{img}original{b['file_path']}" for b in backdrops],
+        "quality": "WEB-RIP", "type": "movie", "players": [],
+        "subBy": SUB_BY, "subtitleUrl": "", "subUrl": "", "dlSubUrl": "",
+        "adult": bool(d.get("adult")), "tmdbId": str(d.get("id", "")),
+        "collection": (d.get("belongs_to_collection") or {}).get("name", ""),
+        "collectionOrder": 0, "adminNote": "", "downloads": [], "seasons": [],
+        "seriesStatus": "ongoing", "isVip": False, "showSubNotice": False,
+        "scheduledAt": None,
+    }
+
+
+def finalize_movie(st: dict) -> dict:
+    m = dict(st["movie"])
+    m["quality"] = st.get("quality", "WEB-RIP")
+    downloads, players = [], []
+    for res in ("480p", "720p", "1080p"):
+        link = st["links"].get(res)
+        if not link:
+            continue
+        pd = pd_convert(link) if "pixeldrain.com" in link else ""
+        downloads.append({
+            "quality": m["quality"], "res": res, "size": "", "url": link,
+            "pd480": pd if res == "480p" else "", "pd720": pd if res == "720p" else "",
+            "pd1080": pd if res == "1080p" else "", "tgLink": "",
+            "srv1": "", "srv2": "", "srv3": "",
+        })
+        stream = pd or (link if re.search(r"\.(m3u8|mp4)(\?|$)", link) else "")
+        if stream:
+            players.append({
+                "name": "MovieManiaLK", "quality": res, "url": stream,
+                "type": "hls" if ".m3u8" in stream else "direct",
+            })
+    m["downloads"], m["players"] = downloads, players
+    if st.get("sub"):
+        m["subtitleUrl"] = m["subUrl"] = st["sub"]
+    if st.get("dlsub"):
+        m["dlSubUrl"] = st["dlsub"]
+    m["addedAt"] = int(time.time() * 1000)
+    return m
+
+
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    context.user_data.clear()
+    context.user_data["add"] = {"step": "search", "links": {}}
+    await update.message.reply_text(
+        "➕ <b>Add Movie</b>\n\n🎬 Movie එකේ නම type කරන්න (TMDB එකෙන් හොයනවා)\n\n/cancel – නවත්වන්න",
+        parse_mode="HTML",
+    )
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancel කළා.")
+
+
+async def skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st = context.user_data.get("add")
+    if not is_admin(update) or not st or st.get("step") not in LINK_STEPS:
+        return
+    await add_advance(update, context)
+
+
+async def add_advance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Move to the next step after the current one is answered or skipped."""
+    st = context.user_data["add"]
+    msg = update.effective_message
+    i = LINK_STEPS.index(st["step"])
+    if i + 1 < len(LINK_STEPS):
+        st["step"] = LINK_STEPS[i + 1]
+        await msg.reply_text(STEP_PROMPT[st["step"]], parse_mode="HTML")
+        return
+    if not st["links"]:
+        context.user_data.clear()
+        await msg.reply_text("⚠️ අඩුම තරමින් download link එකක් ඕනේ. /add කරලා ආයෙ පටන් ගන්න.")
+        return
+    st["step"] = "quality"
+    rows = [[InlineKeyboardButton(q, callback_data=f"ad:q:{q}") for q in QUALITIES[:2]],
+            [InlineKeyboardButton(q, callback_data=f"ad:q:{q}") for q in QUALITIES[2:]]]
+    await msg.reply_text("💿 <b>Quality</b> තොරන්න:", parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st = context.user_data["add"]
+    text = update.message.text.strip()
+    step = st["step"]
+
+    if step == "search":
+        try:
+            data = await tmdb_get("/search/movie", query=text, include_adult="false")
+        except Exception:
+            log.exception("tmdb search failed")
+            await update.message.reply_text("⚠️ TMDB error. පස්සේ try කරන්න.")
+            return
+        results = data.get("results", [])[:8]
+        if not results:
+            await update.message.reply_text("😕 කිසිවක් හම්බුනේ නෑ. වෙන නමකින් try කරන්න.")
+            return
+        lines, buttons = ["🔎 <b>Results</b> — අංකය තොරන්න:\n"], []
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. 🎬 {html.escape(r.get('title', '?'))} ({(r.get('release_date') or '')[:4]}) "
+                         f"⭐{r.get('vote_average', 0):.1f}")
+            buttons.append(InlineKeyboardButton(str(i), callback_data=f"ad:pick:{r['id']}"))
+        rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                        reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if step in LINK_STEPS:
+        if not text.startswith("http"):
+            await update.message.reply_text("❌ Link එක http:// හෝ https:// වලින් පටන් ගන්න ඕනේ. නැත්නම් /skip")
+            return
+        if step.startswith("link"):
+            st["links"][step.replace("link", "") + ("p" if True else "")] = text
+        else:
+            st[step] = text
+        await add_advance(update, context)
+
+
+async def add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split(":", 2)
+    action, arg = parts[1], (parts[2] if len(parts) > 2 else "")
+    st = context.user_data.get("add")
+
+    if action == "cancel":
+        context.user_data.clear()
+        await q.edit_message_text("❌ Cancel කළා.")
+        return
+    if not st:
+        await q.message.reply_text("⚠️ Session expire. /add කරලා ආයෙ පටන් ගන්න.")
+        return
+
+    if action == "pick":
+        d = await tmdb_get(f"/movie/{arg}", language="en-US",
+                           append_to_response="credits,videos,images",
+                           include_image_language="en,null")
+        st["movie"] = movie_from_tmdb(d)
+        st["step"] = LINK_STEPS[0]
+        m = st["movie"]
+        await q.message.reply_text(
+            f"✅ <b>{html.escape(m['title'])}</b> ({m['year']}) TMDB data ලැබුණා\n\n" + STEP_PROMPT[LINK_STEPS[0]],
+            parse_mode="HTML",
+        )
+
+    elif action == "q":
+        st["quality"] = arg
+        st["step"] = "confirm"
+        final = finalize_movie(st)
+        st["final"] = final
+        card = site_caption(final)
+        links = ", ".join(x["res"] for x in final["downloads"])
+        info = (f"\n\n🔗 Links: {links or '—'}"
+                f"\n📝 Sub: {'✅' if final['subUrl'] else '—'}   📦 Sub zip: {'✅' if final['dlSubUrl'] else '—'}")
+        poster = (final["poster"] or "").replace("/t/p/original/", "/t/p/w780/")
+        try:
+            if poster:
+                await q.message.reply_photo(poster, caption=card, parse_mode="HTML")
+            else:
+                await q.message.reply_text(card, parse_mode="HTML")
+        except Exception:
+            await q.message.reply_text(card, parse_mode="HTML")
+        await q.message.reply_text(
+            "👆 Preview එක." + info + "\n\nSave කරමුද?",
+            reply_markup=InlineKeyboardMarkup([
+                [btn_cb("✅ Save & Post", "ad:save:post", "success")],
+                [InlineKeyboardButton("💾 Save only (post නොකර)", callback_data="ad:save:only")],
+                [btn_cb("❌ Cancel", "ad:cancel", "danger")],
+            ]),
+        )
+
+    elif action == "save":
+        final = st.get("final")
+        if not final:
+            return
+        try:
+            movie_id = await unique_movie_id(final["title"])
+            POSTED.add(movie_id)  # stop auto-post loop from posting it a 2nd time
+            await fb_put(f"movies/{movie_id}", final)
+        except Exception as ex:
+            log.exception("save movie failed")
+            await q.edit_message_text(f"❌ Save failed: {ex}")
+            return
+        result = f"✅ <b>Saved!</b>\n🎬 {html.escape(final['title'])}\n🔗 {movie_link(movie_id, final)}"
+        if arg == "post":
+            try:
+                await post_site_movie(context.bot, movie_id, final)
+                result += "\n📢 Channel එකට post කළා"
+            except Exception as ex:
+                log.exception("post after save failed")
+                result += f"\n⚠️ Post failed: {ex}"
+        for path, val in (
+            (f"{POSTED_PATH}/{movie_id}", True),
+            (f"telegram_bot/history/{movie_id}", {"title": final["title"], "ts": int(time.time() * 1000)}),
+        ):
+            if path.endswith(movie_id) and "history" in path and arg != "post":
+                continue
+            try:
+                await fb_put(path, val)
+            except Exception:
+                pass
+        context.user_data.clear()
+        await q.edit_message_text(result, parse_mode="HTML", disable_web_page_preview=True)
+
+
+def btn_cb(text: str, data: str, style: str | None = None) -> InlineKeyboardButton:
+    if not style:
+        return InlineKeyboardButton(text, callback_data=data)
+    try:
+        return InlineKeyboardButton(text, callback_data=data, style=style)
+    except TypeError:
+        return InlineKeyboardButton(text, callback_data=data, api_kwargs={"style": style})
+
+
+# ---------- SITE ADMIN (add / manage movies from Telegram) ----------
+TMDB_IMG = "https://image.tmdb.org/t/p/"
+QUALITIES = ["WEB-RIP", "WEB-DL", "BLURAY", "HD-RIP", "CAM", "CAMCOPY", "ORIGINAL WEB", "4K"]
+SUB_BY = os.environ.get("SUB_BY", "Piratelk.com")
+
+
+def pd_convert(url: str) -> str:
+    """Same logic as pdConvert() in the admin panel (Pixeldrain share -> stream link)."""
+    url = (url or "").strip()
+    if not url:
+        return url
+    if re.search(r"pixeldrain\.com/api/file/[A-Za-z0-9_-]+$", url) and "?download" not in url:
+        return url
+    if "/api/file/" in url and "?download" in url:
+        return url.replace("?download", "")
+    m = re.search(r"pixeldrain\.com/[ul]/([A-Za-z0-9_-]+)", url)
+    if m:
+        return f"https://pixeldrain.com/api/file/{m.group(1)}"
+    return url
+
+
+def slugify(t: str) -> str:
+    t = re.sub(r"['’`]", "", (t or "").lower())
+    return re.sub(r"[^a-z0-9]+", "-", t).strip("-")[:80] or "untitled"
+
+
+async def unique_movie_id(title: str) -> str:
+    import random
+    base = slugify(title)
+    for _ in range(8):
+        cid = f"{base}-{random.randint(10, 99)}"
+        if await fb_get(f"movies/{cid}") is None:
+            return cid
+    return f"{base}-{str(int(time.time() * 1000))[-4:]}"
+
+
+def draft_from_tmdb(d: dict, media_type: str) -> dict:
+    """Builds the same record the admin panel's saveMovie() writes."""
+    vids = d.get("videos", {}).get("results", [])
+    yt = [v for v in vids if v.get("site") == "YouTube"]
+    trailer = (
+        next((v for v in yt if v.get("type") == "Trailer" and v.get("official")), None)
+        or next((v for v in yt if v.get("type") == "Trailer"), None)
+        or (yt[0] if yt else None)
+    )
+    crew = d.get("credits", {}).get("crew", [])
+    cast = d.get("credits", {}).get("cast", [])
+    if d.get("production_countries"):
+        country = ", ".join(c["name"] for c in d["production_countries"])
+    else:
+        country = ", ".join(d.get("origin_country") or [])
+    mins = d.get("runtime") or 0
+    backdrops = d.get("images", {}).get("backdrops", [])[:6]
+    date = d.get("release_date") or d.get("first_air_date") or ""
+    vote = d.get("vote_average") or 0
+    coll = (d.get("belongs_to_collection") or {}).get("name", "")
+    return {
+        "title": d.get("title") or d.get("name") or "",
+        "year": date[:4],
+        "genre": ", ".join(g["name"] for g in d.get("genres", [])),
+        "runtime": f"{mins // 60}h {mins % 60}m" if mins else "",
+        "rating": f"{vote:.1f}" if vote else "",
+        "description": d.get("overview") or "",
+        "describedBy": "",
+        "poster": f"{TMDB_IMG}original{d['poster_path']}" if d.get("poster_path") else "",
+        "backdrop": f"{TMDB_IMG}original{d['backdrop_path']}" if d.get("backdrop_path") else "",
+        "director": ", ".join(c["name"] for c in crew if c.get("job") == "Director"),
+        "cast": ", ".join(c["name"] for c in cast[:8]),
+        "country": country,
+        "trailer": f"https://www.youtube.com/watch?v={trailer['key']}" if trailer else "",
+        "screenshots": [f"{TMDB_IMG}original{b['file_path']}" for b in backdrops],
+        "quality": "WEB-RIP",
+        "type": media_type,
+        "players": [],
+        "subBy": SUB_BY,
+        "subtitleUrl": "",
+        "subUrl": "",
+        "dlSubUrl": "",
+        "adult": bool(d.get("adult")),
+        "tmdbId": str(d.get("id") or ""),
+        "collection": coll,
+        "collectionOrder": 0,
+        "adminNote": "",
+        "downloads": [],
+        "seasons": [],
+        "seriesStatus": "ongoing",
+        "isVip": False,
+        "showSubNotice": False,
+        "scheduledAt": None,
+    }
+
+
+def parse_links(text: str, quality: str):
+    """Each line: any mix of resolution (720p), size (1.2GB) and a URL."""
+    downloads, players = [], []
+    for line in text.splitlines():
+        um = re.search(r"https?://\S+", line)
+        if not um:
+            continue
+        url = um.group(0)
+        rm = re.search(r"\b(2160|1080|720|480|360)p?\b", line, re.I)
+        sm = re.search(r"(\d+(?:\.\d+)?)\s?(GB|MB)", line, re.I)
+        res = int(rm.group(1)) if rm else 720
+        res_s = f"{res}p"
+        size = f"{sm.group(1)} {sm.group(2).upper()}" if sm else ""
+        pdv = pd_convert(url)
+        is_pd = "pixeldrain.com/api/file/" in pdv
+        downloads.append({
+            "quality": quality, "res": res_s, "size": size, "url": url,
+            "pd480": pdv if is_pd and res == 480 else "",
+            "pd720": pdv if is_pd and res == 720 else "",
+            "pd1080": pdv if is_pd and res == 1080 else "",
+            "tgLink": "", "srv1": "", "srv2": "", "srv3": "",
+        })
+        if is_pd:
+            players.append({"name": "MovieManiaLK", "quality": res_s, "url": pdv, "type": "direct"})
+    return downloads, players
+
+
+def draft_summary(dr: dict, meta: dict) -> str:
+    e = html.escape
+    links = ", ".join(f"{x['res']}{(' ' + x['size']) if x['size'] else ''}" for x in dr["downloads"]) or "නෑ"
+    lines = [
+        "➕ <b>Add to Site</b>", SEP,
+        f"🎬 <b>{e(dr['title'])}</b> ({e(dr['year'])})",
+        f"💿 Quality: <b>{e(dr['quality'])}</b>   ⭐ VIP: <b>{'ON' if dr['isVip'] else 'OFF'}</b>",
+        f"📥 Links: <b>{e(links)}</b>",
+        f"💬 Subtitle: <b>{'✅' if dr['dlSubUrl'] else '—'}</b>",
+    ]
+    if meta.get("dup"):
+        lines.append(f"⚠️ Site එකේ දැනටමත් තියෙනවා: <code>{e(meta['dup'])}</code>")
+    return "\n".join(lines)
+
+
+def draft_keyboard(dr: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"💿 {dr['quality']}", callback_data="add:qual"),
+            InlineKeyboardButton(f"⭐ VIP: {'ON' if dr['isVip'] else 'OFF'}", callback_data="add:vip"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Links", callback_data="add:links"),
+            InlineKeyboardButton("💬 Subtitle", callback_data="add:sub"),
+        ],
+        [
+            InlineKeyboardButton("✅ Save to Site", callback_data="add:save"),
+            InlineKeyboardButton("❌ Cancel", callback_data="add:cancel"),
+        ],
+    ])
+
+
+LINKS_PROMPT = (
+    "🔗 <b>Download links එවන්න</b> (පේළියකට එක link එකක්)\n\n"
+    "<code>720p 1.2GB https://pixeldrain.com/u/abc123\n"
+    "1080p 2.4GB https://pixeldrain.com/u/xyz789</code>\n\n"
+    "Resolution (480p/720p/1080p) සහ size optional. Pixeldrain link නම් Watch Online එකටත් auto set වෙනවා."
+)
+
+
+async def handle_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    ud = context.user_data
+    dr = ud.get("draft")
+    if not dr:
+        ud.clear()
+        await update.message.reply_text("⚠️ Session expire. ආයෙ නමක් එවන්න.")
+        return
+    if ud["state"] == "add_links":
+        downloads, players = parse_links(text, dr["quality"])
+        if not downloads:
+            await update.message.reply_text("❌ http:// හෝ https:// link එකක් හොයාගන්න බෑ. ආයෙ එවන්න.")
+            return
+        dr["downloads"], dr["players"] = downloads, players
+    else:  # add_sub
+        if text.lower() not in ("/skip", "skip", "-"):
+            if not text.startswith("http"):
+                await update.message.reply_text("❌ Link එක http:// වලින් පටන් ගන්න ඕනේ. නැත්නම් /skip")
+                return
+            dr["dlSubUrl"] = text
+            if text.lower().split("?")[0].endswith((".srt", ".vtt")):
+                dr["subUrl"] = dr["subtitleUrl"] = text
+    ud["state"] = None
+    await update.message.reply_text(
+        draft_summary(dr, ud.get("draft_meta", {})), parse_mode="HTML",
+        reply_markup=draft_keyboard(dr),
+    )
+
+
+async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    ud = context.user_data
+    parts = q.data.split(":", 2)
+    kind, action = parts[0], parts[1]
+
+    # ---- delete / vip (from /del and /vip) ----
+    if kind == "del":
+        if action == "no":
+            await q.edit_message_text("❌ Cancel කළා.")
+            return
+        mid = parts[2]
+        try:
+            m = await fb_get(f"movies/{mid}")
+            if not isinstance(m, dict):
+                await q.edit_message_text("❌ ඒ movie එක නෑ.")
+                return
+            v, dl, sub = num(m.get("views")), num(m.get("downloads_count")), num(m.get("subtitle_downloads_count"))
+            if v or dl or sub:  # keep history, same as the admin panel
+                cur = await fb_get("analytics/deletedStats") or {}
+                await fb_put("analytics/deletedStats", {
+                    "totalViews": num(cur.get("totalViews")) + v,
+                    "totalDownloads": num(cur.get("totalDownloads")) + dl,
+                    "totalSubDownloads": num(cur.get("totalSubDownloads")) + sub,
+                    "deletedCount": num(cur.get("deletedCount")) + 1,
+                })
+            await fb_delete(f"movies/{mid}")
+            await q.edit_message_text(f"🗑 Deleted: {html.escape(str(m.get('title')))}", parse_mode="HTML")
+        except Exception as ex:
+            log.exception("delete failed")
+            await q.edit_message_text(f"❌ Failed: {ex}")
+        return
+    if kind == "vip":
+        mid = action if len(parts) == 2 else f"{action}:{parts[2]}"
+        try:
+            m = await fb_get(f"movies/{mid}")
+            if not isinstance(m, dict):
+                await q.edit_message_text("❌ ඒ movie එක නෑ.")
+                return
+            new = not bool(m.get("isVip"))
+            await fb_put(f"movies/{mid}/isVip", new)
+            await q.edit_message_text(
+                f"⭐ <b>{html.escape(str(m.get('title')))}</b>\nVIP: <b>{'ON' if new else 'OFF'}</b>",
+                parse_mode="HTML",
+            )
+        except Exception as ex:
+            await q.edit_message_text(f"❌ Failed: {ex}")
+        return
+
+    # ---- add flow ----
+    if action == "start":
+        tmdb = ud.get("tmdb")
+        if not tmdb:
+            await q.message.reply_text("⚠️ Session expire. ආයෙ නමක් එවන්න.")
+            return
+        d, media_type = tmdb
+        if media_type == "tv":
+            await q.message.reply_text(
+                "📺 TV Series (seasons/episodes) bot එකෙන් add කරන්න තාම බෑ.\n"
+                "Admin panel එකෙන් add කරන්න. (Channel post only වැඩ කරනවා.)"
+            )
+            return
+        dr = draft_from_tmdb(d, media_type)
+        meta = {}
+        try:  # warn if this TMDB id is already on the site
+            for k, v in (await fb_get("movies") or {}).items():
+                if isinstance(v, dict) and str(v.get("tmdbId")) == dr["tmdbId"]:
+                    meta["dup"] = k
+                    break
+        except Exception:
+            pass
+        ud["draft"], ud["draft_meta"], ud["state"] = dr, meta, "add_links"
+        await q.message.reply_text(LINKS_PROMPT, parse_mode="HTML")
+        return
+
+    dr = ud.get("draft")
+    if not dr:
+        await q.edit_message_text("⚠️ Session expire. ආයෙ නමක් එවන්න.")
+        return
+    meta = ud.get("draft_meta", {})
+
+    if action == "cancel":
+        ud.clear()
+        await q.edit_message_text("❌ Cancel කළා.")
+    elif action in ("qual", "vip"):
+        if action == "qual":
+            i = QUALITIES.index(dr["quality"]) if dr["quality"] in QUALITIES else -1
+            dr["quality"] = QUALITIES[(i + 1) % len(QUALITIES)]
+            for x in dr["downloads"]:
+                x["quality"] = dr["quality"]
+        else:
+            dr["isVip"] = not dr["isVip"]
+        await q.edit_message_text(draft_summary(dr, meta), parse_mode="HTML", reply_markup=draft_keyboard(dr))
+    elif action == "links":
+        ud["state"] = "add_links"
+        await q.message.reply_text(LINKS_PROMPT, parse_mode="HTML")
+    elif action == "sub":
+        ud["state"] = "add_sub"
+        await q.message.reply_text("💬 Subtitle download link එක (.zip / .srt) එවන්න. නැත්නම් /skip")
+    elif action == "save":
+        if not dr["downloads"]:
+            await q.answer("Download link එකක් මුලින් දාන්න!", show_alert=True)
+            return
+        try:
+            movie = dict(dr)
+            movie["addedAt"] = int(time.time() * 1000)
+            cid = await unique_movie_id(movie["title"])
+            await fb_put(f"movies/{cid}", movie)
+        except Exception as ex:
+            log.exception("site save failed")
+            await q.edit_message_text(f"❌ Save failed: {ex}")
+            return
+        ud.clear()
+        link = f"{SITE_URL}/movie/{cid}-sinhala-subtitles"
+        note = "Auto post ON නිසා විනාඩි 2ක් ඇතුළත channel එකට යනවා 📣" if AUTOPOST else "Auto post OFF නිසා channel එකට යන්නේ නෑ (/repost " + cid + ")."
+        await q.edit_message_text(
+            f"✅ <b>Site එකට add කළා!</b>\n🎬 {html.escape(movie['title'])}\n"
+            f"🆔 <code>{html.escape(cid)}</code>\n\n{note}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[btn("🌐 Open on site", link, "primary")]]),
+        )
+
+
+async def find_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    term = " ".join(context.args).strip().lower()
+    if not term:
+        await update.message.reply_text("Usage: /find movie-name")
+        return
+    try:
+        movies = await fb_get("movies") or {}
+    except Exception:
+        await update.message.reply_text("⚠️ Firebase error.")
+        return
+    hits = [(k, v) for k, v in movies.items()
+            if isinstance(v, dict) and term in str(v.get("title", "")).lower()][:8]
+    if not hits:
+        await update.message.reply_text("😕 කිසිවක් හම්බුනේ නෑ.")
+        return
+    lines = ["🔎 <b>Results</b>\n"]
+    for k, v in hits:
+        vip = " ⭐VIP" if v.get("isVip") else ""
+        lines.append(
+            f"🎬 <b>{html.escape(str(v.get('title')))}</b> ({html.escape(str(v.get('year', '')))}){vip}\n"
+            f"   <code>{html.escape(k)}</code>  👁 {fmt(num(v.get('views')))}  📥 {fmt(num(v.get('downloads_count')))}"
+        )
+    lines.append("\n/vip id  •  /del id  •  /repost id")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /del movie-id  (id එක /find එකෙන් ගන්න)")
+        return
+    mid = context.args[0]
+    m = await fb_get(f"movies/{mid}")
+    if not isinstance(m, dict):
+        await update.message.reply_text("❌ ඒ ID එකෙන් movie එකක් නෑ.")
+        return
+    await update.message.reply_text(
+        f"🗑 <b>{html.escape(str(m.get('title')))}</b> delete කරන්නද?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Yes, delete", callback_data=f"del:yes:{mid}"),
+            InlineKeyboardButton("❌ No", callback_data="del:no"),
+        ]]),
+    )
+
+
+async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /vip movie-id")
+        return
+    mid = context.args[0]
+    m = await fb_get(f"movies/{mid}")
+    if not isinstance(m, dict):
+        await update.message.reply_text("❌ ඒ ID එකෙන් movie එකක් නෑ.")
+        return
+    new = not bool(m.get("isVip"))
+    await fb_put(f"movies/{mid}/isVip", new)
+    await update.message.reply_text(
+        f"⭐ <b>{html.escape(str(m.get('title')))}</b>\nVIP: <b>{'ON' if new else 'OFF'}</b>", parse_mode="HTML"
+    )
+
+
 # ---------- AUTO POST (admin panel -> channel) ----------
 async def fb_get(path: str, **params):
     if FIREBASE_API_KEY:
@@ -633,6 +1312,13 @@ async def fb_get(path: str, **params):
         r = await client.get(f"{FIREBASE_DB_URL}/{path}.json", params=params)
         r.raise_for_status()
         return r.json()
+
+
+async def fb_delete(path: str):
+    params = {"key": FIREBASE_API_KEY} if FIREBASE_API_KEY else {}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.delete(f"{FIREBASE_DB_URL}/{path}.json", params=params)
+        r.raise_for_status()
 
 
 async def fb_put(path: str, value):
@@ -665,6 +1351,7 @@ async def post_site_movie(bot, movie_id: str, m: dict):
     caption = site_caption(m)
     kb = post_keyboard(movie_link(movie_id, m), (m.get("trailer") or "").strip() or None)
     poster = (m.get("poster") or m.get("backdrop") or "").strip()
+    poster = poster.replace("/t/p/original/", "/t/p/w780/")  # Telegram photo size limit
     if poster.startswith("http"):
         try:
             await bot.send_photo(CHANNEL_ID, poster, caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -732,13 +1419,15 @@ async def auto_post_loop(app: Application):
         saved = await fb_get(POSTED_PATH)
         if saved is None:
             keys = await fb_get("movies", shallow="true") or {}
-            posted = set(keys)
+            POSTED.update(keys)
+            posted = POSTED
             try:
                 await fb_put(POSTED_PATH, {k: True for k in posted} or {"_init": True})
             except Exception:
                 log.warning("Firebase write not allowed - posted list kept in memory only")
         else:
-            posted = set(saved)
+            POSTED.update(saved)
+            posted = POSTED
     except Exception:
         log.exception("auto post init failed")
         return
@@ -766,6 +1455,13 @@ def main():
     app.add_handler(CommandHandler("last", last_cmd))
     app.add_handler(CommandHandler("repost", repost_cmd))
     app.add_handler(CommandHandler("requests", requests_cmd))
+    app.add_handler(CommandHandler("find", find_cmd))
+    app.add_handler(CommandHandler("del", del_cmd))
+    app.add_handler(CommandHandler("vip", vip_cmd))
+    app.add_handler(CommandHandler("skip", on_text))
+    app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("skip", skip_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Bot started")
