@@ -740,31 +740,108 @@ def draft_from_tmdb(d: dict, media_type: str) -> dict:
     }
 
 
-def parse_links(text: str, quality: str):
-    """Each line: any mix of resolution (720p), size (1.2GB) and a URL."""
-    downloads, players = [], []
+TG_RE = re.compile(r"(?:t\.me|telegram\.me)/", re.I)
+RES_RE = re.compile(r"(?<![0-9])(2160|1080|720|480|360)p?(?![0-9a-z])", re.I)
+SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s?(GB|MB)", re.I)
+
+
+def quality_from_name(name: str) -> str:
+    """WEB-DL / WEB-RIP / BLURAY / HD-RIP / CAM / 4K from a file name."""
+    n = (name or "").lower()
+    if re.search(r"web[-._ ]?dl", n):
+        return "WEB-DL"
+    if re.search(r"web[-._ ]?rip", n):
+        return "WEB-RIP"
+    if re.search(r"blu[-._ ]?ray|bdrip|brrip", n):
+        return "BLURAY"
+    if re.search(r"hd[-._ ]?rip", n):
+        return "HD-RIP"
+    if re.search(r"hd[-._ ]?cam|cam[-._ ]?rip|(?<![a-z])cam(?![a-z])", n):
+        return "CAM"
+    if re.search(r"2160p|(?<![a-z0-9])4k(?![a-z0-9])|uhd", n):
+        return "4K"
+    return ""
+
+
+def human_size(num_bytes) -> str:
+    b = num(num_bytes)
+    if b <= 0:
+        return ""
+    if b >= 1024 ** 3:
+        return f"{b / 1024 ** 3:.1f} GB"
+    return f"{b / 1024 ** 2:.0f} MB"
+
+
+async def pd_info(url: str):
+    """Pixeldrain file info (name, size) so resolution / size / quality can be auto-detected."""
+    m = re.search(r"pixeldrain\.com/(?:u|api/file)/([A-Za-z0-9_-]+)", url)
+    if not m:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://pixeldrain.com/api/file/{m.group(1)}/info")
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        log.warning("pixeldrain info failed for %s", url)
+    return None
+
+
+async def build_downloads(text: str, quality: str):
+    """Each line: links (+ optional resolution / size). Missing resolution, size and quality
+    are auto-detected from the Pixeldrain file name. t.me -> Telegram button; first other link
+    -> main download; extra links -> server 1-3; same resolution lines are merged.
+    Returns (downloads, players, detected_quality)."""
+    by_res: dict = {}
+    players = []
+    detected = ""
     for line in text.splitlines():
-        um = re.search(r"https?://\S+", line)
-        if not um:
+        urls = re.findall(r"https?://\S+", line)
+        if not urls:
             continue
-        url = um.group(0)
-        rm = re.search(r"\b(2160|1080|720|480|360)p?\b", line, re.I)
-        sm = re.search(r"(\d+(?:\.\d+)?)\s?(GB|MB)", line, re.I)
+        tg = [u for u in urls if TG_RE.search(u)]
+        others = [u for u in urls if not TG_RE.search(u)]
+        words = line
+        for u in urls:
+            words = words.replace(u, " ")
+
+        info = await pd_info(others[0]) if others else None
+        fname = (info or {}).get("name", "")
+
+        rm = RES_RE.search(words) or RES_RE.search(" ".join(others)) or RES_RE.search(fname)
         res = int(rm.group(1)) if rm else 720
         res_s = f"{res}p"
-        size = f"{sm.group(1)} {sm.group(2).upper()}" if sm else ""
-        pdv = pd_convert(url)
-        is_pd = "pixeldrain.com/api/file/" in pdv
-        downloads.append({
-            "quality": quality, "res": res_s, "size": size, "url": url,
-            "pd480": pdv if is_pd and res == 480 else "",
-            "pd720": pdv if is_pd and res == 720 else "",
-            "pd1080": pdv if is_pd and res == 1080 else "",
+        sm = SIZE_RE.search(words) or SIZE_RE.search(" ".join(others))
+        size = f"{sm.group(1)} {sm.group(2).upper()}" if sm else human_size((info or {}).get("size"))
+        q = quality_from_name(fname) or quality_from_name(" ".join(others)) or quality_from_name(words)
+        detected = detected or q
+
+        e = by_res.setdefault(res_s, {
+            "quality": q or quality, "res": res_s, "size": "", "url": "",
+            "pd480": "", "pd720": "", "pd1080": "",
             "tgLink": "", "srv1": "", "srv2": "", "srv3": "",
         })
-        if is_pd:
-            players.append({"name": "MovieManiaLK", "quality": res_s, "url": pdv, "type": "direct"})
-    return downloads, players
+        if size and not e["size"]:
+            e["size"] = size
+        if tg and not e["tgLink"]:
+            e["tgLink"] = tg[0]
+        if others:
+            if not e["url"]:
+                e["url"] = others[0]
+                extra = others[1:4]
+            else:
+                extra = others[:3]
+            for u in extra:
+                for k in ("srv1", "srv2", "srv3"):
+                    if not e[k]:
+                        e[k] = u
+                        break
+            pdv = pd_convert(others[0])
+            if "pixeldrain.com/api/file/" in pdv:
+                if res in (480, 720, 1080) and not e[f"pd{res}"]:
+                    e[f"pd{res}"] = pdv
+                players.append({"name": "MovieManiaLK", "quality": res_s, "url": pdv, "type": "direct"})
+    return list(by_res.values()), players, detected
 
 
 def detect_player_type(name: str, url: str) -> str:
@@ -806,7 +883,10 @@ def parse_players(text: str):
 
 def draft_summary(dr: dict, meta: dict) -> str:
     e = html.escape
-    links = ", ".join(f"{x['res']}{(' ' + x['size']) if x['size'] else ''}" for x in dr["downloads"]) or "නෑ"
+    links = ", ".join(
+        f"{x['res']}{(' ' + x['size']) if x['size'] else ''}{' 📨' if x.get('tgLink') else ''}"
+        for x in dr["downloads"]
+    ) or "නෑ"
     lines = [
         "➕ <b>Add to Site</b>", SEP,
         f"🎬 <b>{e(dr['title'])}</b> ({e(dr['year'])})",
@@ -845,10 +925,13 @@ def draft_keyboard(dr: dict) -> InlineKeyboardMarkup:
 
 
 LINKS_PROMPT = (
-    "🔗 <b>Download links එවන්න</b> (පේළියකට එක link එකක්)\n\n"
-    "<code>720p 1.2GB https://pixeldrain.com/u/abc123\n"
-    "1080p 2.4GB https://pixeldrain.com/u/xyz789</code>\n\n"
-    "Resolution (480p/720p/1080p) සහ size optional. Pixeldrain link නම් Watch Online එකටත් auto set වෙනවා."
+    "🔗 <b>Download links එවන්න</b> (පේළියකට එක quality එකක්)\n\n"
+    "<code>720p 1.2GB https://pixeldrain.com/u/abc https://t.me/yourbot?start=abc720\n"
+    "1080p 2.4GB https://pixeldrain.com/u/xyz https://t.me/yourbot?start=xyz1080</code>\n\n"
+    "• <b>t.me</b> link එක → Telegram download button එකට\n"
+    "• ඉතුරු පළවෙනි link එක → main download, තව links → Server 2/3/4\n"
+    "• Pixeldrain link නම් resolution, size, quality (WEB-DL...) file name එකෙන් auto detect වෙනවා\n"
+    "• Pixeldrain link Watch Online එකටත් auto set වෙනවා"
 )
 
 
@@ -863,11 +946,13 @@ async def handle_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     skip = text.lower() in ("/skip", "skip", "-")
     st = ud["state"]
     if st == "add_links":
-        downloads, players = parse_links(text, dr["quality"])
+        downloads, players, det = await build_downloads(text, dr["quality"])
         if not downloads:
             await update.message.reply_text("❌ http:// හෝ https:// link එකක් හොයාගන්න බෑ. ආයෙ එවන්න.")
             return
         dr["downloads"] = downloads
+        if det:
+            dr["quality"] = det  # auto-detected from the file name
         if not meta.get("custom_players"):  # keep hand-made players
             dr["players"] = players
     elif st == "add_player":
@@ -1023,7 +1108,7 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     elif action == "sub":
         ud["state"] = "add_sub"
-        await q.message.reply_text("💬 Subtitle download link එක (.zip / .srt) එවන්න. නැත්නම් /skip")
+        await q.message.reply_text("💬 Subtitle <b>file එක</b> (.srt / .vtt / .zip) කෙලින්ම forward/upload කරන්න, නැත්නම් link එකක් එවන්න. /skip", parse_mode="HTML")
     elif action in ("savepost", "saveonly"):
         if not dr["downloads"]:
             await q.answer("Download link එකක් මුලින් දාන්න!", show_alert=True)
@@ -1064,6 +1149,75 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             result, parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[btn("🌐 Open on site", movie_link(cid, movie), "primary")]]),
         )
+
+
+# ---------- SUBTITLE FILE UPLOAD (send .srt/.vtt/.zip to the bot) ----------
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://oqisvxsvkjyltvpwnago.supabase.co")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")  # optional - Railway variable only
+SUPABASE_SUB_BUCKET = os.environ.get("SUPABASE_SUB_BUCKET", "subtitles")
+FIREBASE_STORAGE_BUCKET = os.environ.get("FIREBASE_STORAGE_BUCKET", "cineflix1-1fdc6.firebasestorage.app")
+SUB_CTYPES = {".srt": "text/plain; charset=utf-8", ".vtt": "text/vtt; charset=utf-8", ".zip": "application/zip"}
+
+
+async def upload_subtitle(filename: str, data: bytes, ext: str) -> str:
+    """Same targets as the site's /api/admin/upload: Supabase if a key is set, else Firebase Storage."""
+    ctype = SUB_CTYPES.get(ext, "application/octet-stream")
+    safe = re.sub(r"[^\w.\-]+", "_", filename)
+    async with httpx.AsyncClient(timeout=60) as client:
+        if SUPABASE_SECRET_KEY:
+            r = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_SUB_BUCKET}/{safe}",
+                headers={"Authorization": f"Bearer {SUPABASE_SECRET_KEY}", "apikey": SUPABASE_SECRET_KEY,
+                         "Content-Type": ctype, "x-upsert": "true"},
+                content=data,
+            )
+            r.raise_for_status()
+            return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_SUB_BUCKET}/{safe}"
+        from urllib.parse import quote
+        path = f"subtitles/{int(time.time() * 1000)}_{safe}"
+        r = await client.post(
+            f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}/o?name={quote(path, safe='')}",
+            headers={"Content-Type": ctype}, content=data,
+        )
+        r.raise_for_status()
+        tok = r.json().get("downloadTokens")
+        return (f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_STORAGE_BUCKET}/o/"
+                f"{quote(path, safe='')}?alt=media" + (f"&token={tok}" if tok else ""))
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ud = context.user_data
+    dr = ud.get("draft")
+    doc = update.message.document
+    if not dr:
+        await update.message.reply_text("ℹ️ මුලින් /add එකෙන් movie එකක් තොරන්න, ඊට පස්සේ subtitle file එක එවන්න.")
+        return
+    name = (doc.file_name or "subtitle").strip()
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in SUB_CTYPES:
+        await update.message.reply_text("❌ .srt / .vtt / .zip files විතරයි.")
+        return
+    if (doc.file_size or 0) > 20 * 1024 * 1024:
+        await update.message.reply_text("❌ File එක 20MB ට වැඩියි.")
+        return
+    wait = await update.message.reply_text("⏳ Subtitle upload කරනවා...")
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        data = bytes(await f.download_as_bytearray())
+        url = await upload_subtitle(f"{slugify(dr['title'])}-{dr['year']}-{int(time.time()) % 100000}{ext}", data, ext)
+    except Exception as ex:
+        log.exception("subtitle upload failed")
+        await wait.edit_text(f"❌ Upload failed: {ex}")
+        return
+    dr["dlSubUrl"] = url
+    if ext in (".srt", ".vtt"):
+        dr["subUrl"] = dr["subtitleUrl"] = url
+    ud["state"] = None
+    await wait.edit_text(
+        draft_summary(dr, ud.get("draft_meta", {})), parse_mode="HTML", reply_markup=draft_keyboard(dr)
+    )
 
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1301,7 +1455,7 @@ async def post_init(app: Application):
     asyncio.create_task(auto_post_loop(app))
 
 
-BOT_VERSION = "2026-10-17 · site-admin v4"
+BOT_VERSION = "2026-10-17 · site-admin v8"
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1341,6 +1495,7 @@ def main():
     app.add_handler(CommandHandler("vip", vip_cmd))
     app.add_handler(CommandHandler("skip", on_text))
     app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
