@@ -1046,6 +1046,43 @@ def parse_links(text: str, quality: str):
     return downloads, players
 
 
+def detect_player_type(name: str, url: str) -> str:
+    if name == "Facebook":
+        return "facebook"
+    if name == "VLC":
+        return "vlc"
+    return "hls" if ".m3u8" in url else "direct"
+
+
+def parse_players(text: str):
+    """Each line: [Facebook|VLC|MovieManiaLK] [720p] <video url or Facebook video ID>."""
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        name = "Facebook" if "facebook" in low else "VLC" if "vlc" in low else "MovieManiaLK"
+        um = re.search(r"https?://\S+", line)
+        rest = line
+        if um:
+            url = um.group(0)
+            rest = line.replace(url, " ")
+        else:
+            fm = re.search(r"\b\d{8,}\b", line)
+            if not (name == "Facebook" and fm):
+                continue
+            url = f"https://fb-con.vercel.app/video?video_id={fm.group(0)}"
+            rest = line.replace(fm.group(0), " ")
+        rm = re.search(r"\b(2160|1080|720|480|360)p?\b", rest)
+        quality = f"{rm.group(1)}p" if rm else "720p"
+        if name != "Facebook":
+            url = pd_convert(url)
+        out.append({"name": name, "quality": quality, "url": url,
+                    "type": detect_player_type(name, url)})
+    return out
+
+
 def draft_summary(dr: dict, meta: dict) -> str:
     e = html.escape
     links = ", ".join(f"{x['res']}{(' ' + x['size']) if x['size'] else ''}" for x in dr["downloads"]) or "නෑ"
@@ -1054,7 +1091,9 @@ def draft_summary(dr: dict, meta: dict) -> str:
         f"🎬 <b>{e(dr['title'])}</b> ({e(dr['year'])})",
         f"💿 Quality: <b>{e(dr['quality'])}</b>   ⭐ VIP: <b>{'ON' if dr['isVip'] else 'OFF'}</b>",
         f"📥 Links: <b>{e(links)}</b>",
-        f"💬 Subtitle: <b>{'✅' if dr['dlSubUrl'] else '—'}</b>",
+        f"▶️ Players: <b>{len(dr['players']) or '—'}</b>   💬 Subtitle file: <b>{'✅' if dr['dlSubUrl'] else '—'}</b>",
+        f"🏷 Subtitle by: <b>{e(dr['subBy'])}</b>",
+        f"📝 Description: <b>{len(dr['description'])} chars</b>" + (" ✏️" if meta.get("custom_desc") else ""),
     ]
     if meta.get("dup"):
         lines.append(f"⚠️ Site එකේ දැනටමත් තියෙනවා: <code>{e(meta['dup'])}</code>")
@@ -1069,8 +1108,13 @@ def draft_keyboard(dr: dict) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔗 Links", callback_data="add:links"),
-            InlineKeyboardButton("💬 Subtitle", callback_data="add:sub"),
+            InlineKeyboardButton("▶️ Player", callback_data="add:player"),
         ],
+        [
+            InlineKeyboardButton("📝 Description", callback_data="add:desc"),
+            InlineKeyboardButton("🏷 Subtitle By", callback_data="add:subby"),
+        ],
+        [InlineKeyboardButton("💬 Subtitle file link", callback_data="add:sub")],
         [
             InlineKeyboardButton("✅ Save to Site", callback_data="add:save"),
             InlineKeyboardButton("❌ Cancel", callback_data="add:cancel"),
@@ -1093,14 +1137,34 @@ async def handle_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         ud.clear()
         await update.message.reply_text("⚠️ Session expire. ආයෙ නමක් එවන්න.")
         return
-    if ud["state"] == "add_links":
+    meta = ud.setdefault("draft_meta", {})
+    skip = text.lower() in ("/skip", "skip", "-")
+    st = ud["state"]
+    if st == "add_links":
         downloads, players = parse_links(text, dr["quality"])
         if not downloads:
             await update.message.reply_text("❌ http:// හෝ https:// link එකක් හොයාගන්න බෑ. ආයෙ එවන්න.")
             return
-        dr["downloads"], dr["players"] = downloads, players
+        dr["downloads"] = downloads
+        if not meta.get("custom_players"):  # keep hand-made players
+            dr["players"] = players
+    elif st == "add_player":
+        if not skip:
+            players = parse_players(text)
+            if not players:
+                await update.message.reply_text("❌ Video link එකක් හොයාගන්න බෑ. ආයෙ එවන්න (නැත්නම් /skip).")
+                return
+            dr["players"] = players
+            meta["custom_players"] = True
+    elif st == "add_desc":
+        if not skip:
+            dr["description"] = text
+            meta["custom_desc"] = True
+    elif st == "add_subby":
+        if not skip:
+            dr["subBy"] = text[:60]
     else:  # add_sub
-        if text.lower() not in ("/skip", "skip", "-"):
+        if not skip:
             if not text.startswith("http"):
                 await update.message.reply_text("❌ Link එක http:// වලින් පටන් ගන්න ඕනේ. නැත්නම් /skip")
                 return
@@ -1210,6 +1274,31 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "links":
         ud["state"] = "add_links"
         await q.message.reply_text(LINKS_PROMPT, parse_mode="HTML")
+    elif action == "player":
+        ud["state"] = "add_player"
+        cur = "\n".join(f"{p['name']} {p['quality']} {p['url']}" for p in dr["players"]) or "—"
+        await q.message.reply_text(
+            "▶️ <b>Player link(s) එවන්න</b> (පේළියකට එකක්)\n\n"
+            "<code>720p https://example.com/video.mp4\n"
+            "VLC 1080p https://example.com/stream.m3u8\n"
+            "Facebook 720p 1234567890123</code>\n\n"
+            "නම නොදුන්නොත් <b>MovieManiaLK</b>. Facebook නම් video ID එකත් ඇති.\n"
+            f"දැන්: <code>{html.escape(cur)[:400]}</code>\n\nවෙනස් නොකරන්න /skip",
+            parse_mode="HTML",
+        )
+    elif action == "desc":
+        ud["state"] = "add_desc"
+        await q.message.reply_text(
+            "📝 <b>Description එක එවන්න</b> (සිංහලෙන් වුණත් ඉතිං).\n"
+            f"දැන්: <i>{html.escape(dr['description'])[:300]}</i>\n\nවෙනස් නොකරන්න /skip",
+            parse_mode="HTML",
+        )
+    elif action == "subby":
+        ud["state"] = "add_subby"
+        await q.message.reply_text(
+            f"🏷 <b>Subtitle By</b> නම එවන්න.\nදැන්: <b>{html.escape(dr['subBy'])}</b>\n\nවෙනස් නොකරන්න /skip",
+            parse_mode="HTML",
+        )
     elif action == "sub":
         ud["state"] = "add_sub"
         await q.message.reply_text("💬 Subtitle download link එක (.zip / .srt) එවන්න. නැත්නම් /skip")
