@@ -980,7 +980,11 @@ async def handle_dl_input(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             tmp["tg"] = tg
         ud["state"] = "dl_url"
         await update.message.reply_text(
-            f"🔗 <b>{res}</b> — Download URL එක එවන්න." + ("\n(t.me link එක දුන්නා, URL එක නැත්නම් /skip)" if tmp.get("tg") else ""),
+            f"🔗 <b>{res}</b> — Download URL එක එවන්න.\n\n"
+            f"(මේක මෙහෙමයි 🫵)\n"
+            f"මේ bot ට @asithacloud_bot <b>{res}</b> file එක forward කරන්න.\n"
+            f"එහිදී ලැබෙන download link එක එවන්න."
+            + ("\n\n(t.me link එක දුන්නා, URL එක නැත්නම් /skip)" if tmp.get("tg") else ""),
             parse_mode="HTML",
         )
         return
@@ -1200,7 +1204,11 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         cur = next((x for x in dr["downloads"] if x["res"] == res), None)
         note = f"\n\nදැනට: <code>{html.escape(cur['url'] or cur['tgLink'])[:200]}</code>\n(මකන්න ඕනේ නම් URL step එකේදී <code>remove</code> කියලා ලියන්න)" if cur else ""
         await q.message.reply_text(
-            f"📨 <b>{res}</b> — Telegram (t.me) link එක එවන්න.\nනැත්නම් /skip{note}",
+            f"📨 <b>{res}</b> — Telegram (t.me) link එක එවන්න\n\n"
+            f"(මේක වෙන්නේ මෙහෙමයි 👇)\n"
+            f"ඔය ගත්තු <b>{res}</b> file එක මේ bot ට @moviemanialk_cloud_bot forward කරන්න 🫵\n"
+            f"forward කිරීමෙදි 👉 /genlink 👈 ඔබ forward කරන්න.\n\n"
+            f"නැත්නම් /skip{note}",
             parse_mode="HTML",
         )
     elif action == "links":
@@ -1233,7 +1241,13 @@ async def handle_site_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     elif action == "sub":
         ud["state"] = "add_sub"
-        await q.message.reply_text("💬 Subtitle <b>file එක</b> (.srt / .vtt / .zip) කෙලින්ම forward/upload කරන්න, නැත්නම් link එකක් එවන්න. /skip", parse_mode="HTML")
+        await q.message.reply_text(
+            "💬 Subtitle file එක (.srt / .vtt / .zip) කෙලින්ම forward/upload කරන්න,\n\n"
+            "(මේක මෙහෙමයි වෙන්නේ 👇)\n"
+            "@moviemanialk_cloudhf_bot ඔය bot ට forward කරලා download link එක copy කරගෙන මෙතනට දාන්න.\n\n"
+            "නැත්නම් link එකක් එවන්න. /skip",
+            parse_mode="HTML",
+        )
     elif action in ("savepost", "saveonly"):
         if not dr["downloads"]:
             await q.answer("Download link එකක් මුලින් දාන්න!", show_alert=True)
@@ -1580,7 +1594,7 @@ async def post_init(app: Application):
     asyncio.create_task(auto_post_loop(app))
 
 
-BOT_VERSION = "2026-10-17 · site-admin  v9 ultra 💔"
+BOT_VERSION = "2026-10-23 · site-admin  v10 ultra 💔"
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
